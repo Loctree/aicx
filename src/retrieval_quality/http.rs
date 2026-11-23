@@ -21,14 +21,20 @@ pub(super) async fn post<T: DeserializeOwned>(
     endpoint: &Endpoint,
     payload: &serde_json::Value,
 ) -> Result<T> {
-    let client = Client::builder().redirect(redirect::Policy::none()).build()
+    let client = Client::builder()
+        .redirect(redirect::Policy::none())
+        .build()
         .map_err(|_| anyhow!("cannot initialize HTTP client"))?;
-    let mut request = client.post(endpoint.url.clone())
+    let mut request = client
+        .post(endpoint.url.clone())
         .timeout(endpoint.timeout)
         .header(header::CONTENT_TYPE, "application/json")
         .body(serde_json::to_vec(payload)?);
-    if let Some(key) = endpoint.api_key_env.as_ref()
-        .and_then(|name| std::env::var(name).ok()).filter(|key| !key.is_empty())
+    if let Some(key) = endpoint
+        .api_key_env
+        .as_ref()
+        .and_then(|name| std::env::var(name).ok())
+        .filter(|key| !key.is_empty())
     {
         request = request.bearer_auth(key);
     }

@@ -1556,7 +1556,7 @@ fn current_indexed_session_keys() -> Result<HashSet<String>> {
     if !generation.join("manifest.json").is_file() {
         return Ok(HashSet::new());
     }
-    let lexical = aicx_retrieve::TantivyAdapter::new(generation)?;
+    let lexical = aicx_retrieve::TantivyAdapter::open_existing(generation)?;
     Ok(lexical.scan_chunk_ids()?.into_iter().collect())
 }
 

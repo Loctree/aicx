@@ -10168,7 +10168,9 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     } = args;
     if let Some(session) = session {
         if rerank || decide {
-            anyhow::bail!("--session searches passages directly; --rerank and --decide require indexed search");
+            anyhow::bail!(
+                "--session searches passages directly; --rerank and --decide require indexed search"
+            );
         }
         let root = aicx::aicx_home::resolve()?;
         return run_session_passage_search(&root, session, query, context, literal, json);
@@ -10262,82 +10264,94 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         filters: index_filters,
         embedder_cached_unavailable: false,
     };
-    let (results, scanned, semantic_status, pushdown_diagnostic, semantic_fallback) =
-        match request.retrieve(&search_query) {
-            Ok(mut pass) => {
-                telemetry.record_base(&pass);
-                if quality.active() {
-                    match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                        Ok(runtime) => {
-                            runtime.block_on(telemetry.apply(&quality, &search_query, &request, &mut pass));
-                        }
-                        Err(_) => telemetry.skip("could not initialize optional HTTP runtime"),
+    let (results, scanned, semantic_status, pushdown_diagnostic, semantic_fallback) = match request
+        .retrieve(&search_query)
+    {
+        Ok(mut pass) => {
+            telemetry.record_base(&pass);
+            if quality.active() {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => {
+                        runtime.block_on(telemetry.apply(
+                            &quality,
+                            &search_query,
+                            &request,
+                            &mut pass,
+                        ));
                     }
+                    Err(_) => telemetry.skip("could not initialize optional HTTP runtime"),
                 }
-                let aicx::search_engine::FilteredSemanticOutcome { outcome, diagnostic } = pass.filtered;
-                let status = (
-                    outcome.backend_label,
-                    outcome.model_id.clone(),
-                    outcome.scanned,
-                    outcome.retrieval_status.clone(),
-                );
-                (
-                    outcome.results,
-                    outcome.scanned,
-                    Some(status),
-                    diagnostic,
-                    None,
-                )
             }
-            Err(err) => {
-                if no_semantic {
-                    eprintln!("{}", coverage.render_line());
-                    anyhow::bail!(
-                        "aicx search --no-semantic requires the published CURRENT lexical index: \
+            let aicx::search_engine::FilteredSemanticOutcome {
+                outcome,
+                diagnostic,
+            } = pass.filtered;
+            let status = (
+                outcome.backend_label,
+                outcome.model_id.clone(),
+                outcome.scanned,
+                outcome.retrieval_status.clone(),
+            );
+            (
+                outcome.results,
+                outcome.scanned,
+                Some(status),
+                diagnostic,
+                None,
+            )
+        }
+        Err(err) => {
+            if no_semantic {
+                eprintln!("{}", coverage.render_line());
+                anyhow::bail!(
+                    "aicx search --no-semantic requires the published CURRENT lexical index: \
                          {} ({})\n  recommendation: {}",
-                        err.kind(),
-                        err.reason(),
-                        err.recommendation()
-                    );
-                }
-                // Filesystem-fuzzy ONLY when no hybrid index exists.
-                // Corrupt / stale / busy / embedder / empty → honest error.
-                if !err.allows_filesystem_fallback() {
-                    if !json {
-                        eprintln!("aicx search: hybrid retrieval failed (no fuzzy swallow).");
-                        eprintln!("  kind:           {}", err.kind());
-                        eprintln!("  reason:         {}", err.reason());
-                        eprintln!("  recommendation: {}", err.recommendation());
-                    }
-                    eprintln!("{}", coverage.render_line());
-                    anyhow::bail!(
-                        "aicx search failed: {} ({})\n  recommendation: {}",
-                        err.kind(),
-                        err.reason(),
-                        err.recommendation()
-                    );
-                }
-                telemetry.skip("published index unavailable; serving the filesystem fallback");
-                let fallback = SemanticFallbackNotice::from_error(&err);
-                let (results, scanned) = aicx::search_engine::fuzzy_search_with_post_filters(
-                    &root,
-                    &search_query,
-                    limit,
-                    &scopes,
-                    filters.frame_kind.map(Into::into),
-                    &post_filters,
-                )?;
+                    err.kind(),
+                    err.reason(),
+                    err.recommendation()
+                );
+            }
+            // Filesystem-fuzzy ONLY when no hybrid index exists.
+            // Corrupt / stale / busy / embedder / empty → honest error.
+            if !err.allows_filesystem_fallback() {
                 if !json {
-                    eprintln!(
-                        "aicx search: index not built; falling back to filesystem fuzzy (recency-ranked)."
-                    );
+                    eprintln!("aicx search: hybrid retrieval failed (no fuzzy swallow).");
                     eprintln!("  kind:           {}", err.kind());
                     eprintln!("  reason:         {}", err.reason());
                     eprintln!("  recommendation: {}", err.recommendation());
                 }
-                (results, scanned, None, None, Some(fallback))
+                eprintln!("{}", coverage.render_line());
+                anyhow::bail!(
+                    "aicx search failed: {} ({})\n  recommendation: {}",
+                    err.kind(),
+                    err.reason(),
+                    err.recommendation()
+                );
             }
-        };
+            telemetry.skip("published index unavailable; serving the filesystem fallback");
+            let fallback = SemanticFallbackNotice::from_error(&err);
+            let (results, scanned) = aicx::search_engine::fuzzy_search_with_post_filters(
+                &root,
+                &search_query,
+                limit,
+                &scopes,
+                filters.frame_kind.map(Into::into),
+                &post_filters,
+            )?;
+            if !json {
+                eprintln!(
+                    "aicx search: index not built; falling back to filesystem fuzzy (recency-ranked)."
+                );
+                eprintln!("  kind:           {}", err.kind());
+                eprintln!("  reason:         {}", err.reason());
+                eprintln!("  recommendation: {}", err.recommendation());
+            }
+            (results, scanned, None, None, Some(fallback))
+        }
+    };
 
     if !json {
         telemetry.print_summary();

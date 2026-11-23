@@ -1379,9 +1379,8 @@ impl AicxMcpServer {
             sort: params.sort.as_deref(),
         };
 
-        let quality = crate::retrieval_quality::QualityConfig::load(
-            &aicx_home, params.rerank, params.decide,
-        );
+        let quality =
+            crate::retrieval_quality::QualityConfig::load(&aicx_home, params.rerank, params.decide);
         let mut telemetry = crate::retrieval_quality::SearchTelemetry::new(&quality, &query);
         let request = crate::search_engine::PublishedSearch {
             home: aicx_home.clone(),
@@ -1391,14 +1390,18 @@ impl AicxMcpServer {
             kind: kind_filter_dir,
             filters: post_filters.clone(),
             embedder_cached_unavailable: post_filters.deep
-                && self.embedder_negative_cache_remaining(Instant::now()).is_some(),
+                && self
+                    .embedder_negative_cache_remaining(Instant::now())
+                    .is_some(),
         };
         let first_request = request.clone();
         let first_query = query.clone();
         let retrieval = tokio::task::spawn_blocking(move || first_request.retrieve(&first_query))
-            .await.map_err(|_| McpError::internal_error("published search worker failed", None))?;
+            .await
+            .map_err(|_| McpError::internal_error("published search worker failed", None))?;
         let attach = |info: &crate::retrieval_quality::SearchTelemetry, payload| {
-            info.attach(payload).map_err(|_| McpError::internal_error("serialize retrieval quality", None))
+            info.attach(payload)
+                .map_err(|_| McpError::internal_error("serialize retrieval quality", None))
         };
         let mut pass = match retrieval {
             Ok(pass) => pass,
@@ -1410,7 +1413,9 @@ impl AicxMcpServer {
                 }
                 telemetry.skip("published index unavailable; serving the filesystem fallback");
                 let payload = render_mcp_fuzzy_fallback_payload(&fallback_request, &fallback)?;
-                return Ok(CallToolResult::success(vec![ContentBlock::text(attach(&telemetry, payload)?)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(attach(
+                    &telemetry, payload,
+                )?)]));
             }
         };
         if pass.dense_failure == Some("embedder_unavailable") {
@@ -1467,19 +1472,16 @@ impl AicxMcpServer {
                     .map_err(|e| {
                         McpError::internal_error(format!("Attach index snapshot: {e}"), None)
                     })?;
-            return Ok(CallToolResult::success(vec![ContentBlock::text(attach(&telemetry, payload)?)]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(attach(
+                &telemetry, payload,
+            )?)]));
         }
 
         // Shared finalize keeps MCP success ordering identical to the CLI and
         // the fuzzy fallback. Kind is already pushed into the semantic query,
         // but we still pass it as a defensive retain (matching the CLI tail) so
         // an off-kind hit cannot slip through if the semantic backend regresses.
-        let results = telemetry.finalize(
-            results,
-            kind_filter_dir,
-            params.sort.as_deref(),
-            limit,
-        );
+        let results = telemetry.finalize(results, kind_filter_dir, params.sort.as_deref(), limit);
 
         let source_paths_verified = crate::oracle::verify_paths(
             results
@@ -1522,7 +1524,9 @@ impl AicxMcpServer {
                     McpError::internal_error(format!("Attach index snapshot: {e}"), None)
                 })?;
 
-        Ok(CallToolResult::success(vec![ContentBlock::text(attach(&telemetry, payload)?)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(attach(
+            &telemetry, payload,
+        )?)]))
     }
 
     #[tool(

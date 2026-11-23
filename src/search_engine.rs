@@ -516,8 +516,8 @@ fn try_semantic_search_with_boundary(
     // CURRENT generation once. Project is a metadata filter, never a
     // separate index precondition and never a fan-out over project shards
     // (that path hung multi-second / multi-GB).
-    let global_query = project_filters.is_empty()
-        || (project_filters.len() == 1 && project_filters[0].is_none());
+    let global_query =
+        project_filters.is_empty() || (project_filters.len() == 1 && project_filters[0].is_none());
     let scopes: Vec<Option<&str>> = if global_query {
         vec![None]
     } else {
@@ -745,10 +745,14 @@ fn open_published_lexical(
     manifest: &aicx_retrieve::Manifest,
 ) -> Result<aicx_retrieve::TantivyAdapter, SemanticError> {
     use aicx_retrieve::LexicalIndex;
-    let meta = directory.join(aicx_retrieve::TANTIVY_INDEX_DIR).join("meta.json");
+    let meta = directory
+        .join(aicx_retrieve::TANTIVY_INDEX_DIR)
+        .join("meta.json");
     let invalid = || SemanticError::IndexCorrupt {
         path: meta.clone(),
-        reason: "published Tantivy index is missing, unreadable or does not match its lexical commit".into(),
+        reason:
+            "published Tantivy index is missing, unreadable or does not match its lexical commit"
+                .into(),
         recommendation: "inspect the CURRENT generation and its lexical artifact".into(),
     };
     // The adapter also serves writers and would initialize an absent directory.
@@ -756,8 +760,11 @@ fn open_published_lexical(
     if !meta.is_file() {
         return Err(invalid());
     }
-    let lexical = aicx_retrieve::TantivyAdapter::open_existing(directory.to_owned()).map_err(|_| invalid())?;
-    if lexical.commit_id().0 != manifest.lexical_commit_id || lexical.doc_count() != manifest.lexical_doc_count {
+    let lexical = aicx_retrieve::TantivyAdapter::open_existing(directory.to_owned())
+        .map_err(|_| invalid())?;
+    if lexical.commit_id().0 != manifest.lexical_commit_id
+        || lexical.doc_count() != manifest.lexical_doc_count
+    {
         return Err(invalid());
     }
     Ok(lexical)
@@ -788,18 +795,20 @@ fn try_lexical_search_native(
     }
 
     // Always the global `_all` hybrid root — project is a filter, not a bucket.
-    let hybrid_root =
-        crate::vector_index::hybrid_root_dir_at(store_root, None).map_err(|err| SemanticError::IndexNotBuilt {
+    let hybrid_root = crate::vector_index::hybrid_root_dir_at(store_root, None).map_err(|err| {
+        SemanticError::IndexNotBuilt {
             path: std::path::PathBuf::new(),
             reason: format!("could not resolve hybrid root: {err}"),
             recommendation: "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index`"
                 .to_string(),
-        })?;
+        }
+    })?;
     let current = hybrid_root.join("CURRENT");
     let corrupt = || SemanticError::IndexCorrupt {
         path: hybrid_root.clone(),
         reason: "published lexical generation or its manifest is unreadable".into(),
-        recommendation: "inspect CURRENT and the generation's manifest and Tantivy artifacts".into(),
+        recommendation: "inspect CURRENT and the generation's manifest and Tantivy artifacts"
+            .into(),
     };
     let published = match std::fs::symlink_metadata(&current) {
         Ok(_) => true,
@@ -812,7 +821,12 @@ fn try_lexical_search_native(
     }
     let manifest_path = gen_dir.join("manifest.json");
     if !manifest_path.try_exists().map_err(|_| corrupt())? {
-        if published || gen_dir.join(aicx_retrieve::TANTIVY_INDEX_DIR).try_exists().map_err(|_| corrupt())? {
+        if published
+            || gen_dir
+                .join(aicx_retrieve::TANTIVY_INDEX_DIR)
+                .try_exists()
+                .map_err(|_| corrupt())?
+        {
             return Err(corrupt());
         }
         return Err(SemanticError::IndexNotBuilt {
@@ -841,9 +855,14 @@ fn try_lexical_search_native(
         reason: "cannot verify the published lexical generation's schema or privacy policy".into(),
         recommendation: "inspect the published generation and current source policy".into(),
     };
-    match (manifest.schema_version.as_str(), &manifest.source_policy_fingerprint) {
+    match (
+        manifest.schema_version.as_str(),
+        &manifest.source_policy_fingerprint,
+    ) {
         ("2.0" | "3.0", Some(expected)) => {
-            if crate::source_index::current_policy_fingerprint().map_err(|_| policy_error())? != *expected {
+            if crate::source_index::current_policy_fingerprint().map_err(|_| policy_error())?
+                != *expected
+            {
                 return Err(policy_error());
             }
         }
@@ -2620,7 +2639,11 @@ impl PublishedSearch {
                 recommendation: "provide a nonempty search phrase without NUL bytes".into(),
             });
         }
-        let scopes = self.projects.iter().map(Option::as_deref).collect::<Vec<_>>();
+        let scopes = self
+            .projects
+            .iter()
+            .map(Option::as_deref)
+            .collect::<Vec<_>>();
         let retrieve = |filters: &SemanticSearchFilters| {
             let mut result = try_semantic_search_filtered(
                 &self.home, query, self.limit, &scopes, self.frame, self.kind, filters,
@@ -2642,17 +2665,28 @@ impl PublishedSearch {
         // generation that might have changed in the meantime.
         let base = retrieve(&lexical)?;
         if !dense_requested {
-            return Ok(PublishedHits { filtered: base, dense_failure: None });
+            return Ok(PublishedHits {
+                filtered: base,
+                dense_failure: None,
+            });
         }
         let failure = if self.embedder_cached_unavailable && dense_requested {
             "embedder_negative_cache"
         } else {
             match retrieve(&self.filters) {
-                Ok(filtered) => return Ok(PublishedHits { filtered, dense_failure: None }),
+                Ok(filtered) => {
+                    return Ok(PublishedHits {
+                        filtered,
+                        dense_failure: None,
+                    });
+                }
                 Err(err) => err.kind(),
             }
         };
-        Ok(PublishedHits { filtered: base, dense_failure: Some(failure) })
+        Ok(PublishedHits {
+            filtered: base,
+            dense_failure: Some(failure),
+        })
     }
 }
 

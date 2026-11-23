@@ -909,7 +909,7 @@ pub fn source_lexical_generation_matches(source_fingerprint: &str) -> Result<boo
     {
         return Ok(false);
     }
-    let lexical = match aicx_retrieve::TantivyAdapter::new(generation_dir.to_path_buf()) {
+    let lexical = match aicx_retrieve::TantivyAdapter::open_existing(generation_dir.to_path_buf()) {
         Ok(lexical) => lexical,
         Err(_) => return Ok(false),
     };
@@ -938,7 +938,7 @@ pub fn current_lexical_chunks() -> Result<Vec<aicx_retrieve::ChunkRef>> {
     let Some(generation_dir) = path.parent() else {
         anyhow::bail!("no generation dir for manifest at {}", path.display());
     };
-    let lexical = aicx_retrieve::TantivyAdapter::new(generation_dir.to_path_buf())?;
+    let lexical = aicx_retrieve::TantivyAdapter::open_existing(generation_dir.to_path_buf())?;
     lexical.read_all_chunks()
 }
 

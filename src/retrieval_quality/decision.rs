@@ -58,7 +58,10 @@ fn assistant_text(response: &Value, protocol: Protocol) -> Option<String> {
 }
 
 fn normalized(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 pub(super) async fn assess(
@@ -75,10 +78,14 @@ pub(super) async fn assess(
         });
     }
     let ids: Vec<_> = (0..pool.len()).map(evidence_id).collect();
-    let documents: Vec<_> = pool.iter().zip(&ids).map(|(hit, id)| {
-        json!({"id": id, "text": document(hit, endpoint.max_doc_bytes)})
-    }).collect();
-    let input = serde_json::to_string(&json!({"query": bounded(query, QUERY_BYTES), "documents": documents}))?;
+    let documents: Vec<_> = pool
+        .iter()
+        .zip(&ids)
+        .map(|(hit, id)| json!({"id": id, "text": document(hit, endpoint.max_doc_bytes)}))
+        .collect();
+    let input = serde_json::to_string(
+        &json!({"query": bounded(query, QUERY_BYTES), "documents": documents}),
+    )?;
     let payload = match endpoint.protocol {
         Protocol::Responses => json!({
             "model": endpoint.model, "input": [
@@ -105,7 +112,10 @@ pub(super) async fn assess(
     );
     let mut seen = HashSet::new();
     ensure!(
-        answer.evidence_ids.iter().all(|id| ids.contains(id) && seen.insert(id)),
+        answer
+            .evidence_ids
+            .iter()
+            .all(|id| ids.contains(id) && seen.insert(id)),
         "unknown or duplicate decision evidence id"
     );
     ensure!(
@@ -113,8 +123,11 @@ pub(super) async fn assess(
         "sufficient verdict requires cited evidence"
     );
     match (answer.verdict, answer.refined_query.as_deref()) {
-        (Verdict::Refine, Some(refined)) if !refined.trim().is_empty() && refined.len() <= QUERY_BYTES
-            && !refined.chars().any(char::is_control) && normalized(refined) != normalized(query) => {}
+        (Verdict::Refine, Some(refined))
+            if !refined.trim().is_empty()
+                && refined.len() <= QUERY_BYTES
+                && !refined.chars().any(char::is_control)
+                && normalized(refined) != normalized(query) => {}
         (Verdict::Sufficient | Verdict::Insufficient, None) => {}
         _ => anyhow::bail!("invalid or redundant refined query"),
     }

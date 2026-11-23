@@ -64,7 +64,9 @@ fn existing_reader_never_initializes_a_missing_generation() {
     assert!(!missing.exists(), "a reader created a missing generation");
 
     let mut writer = TantivyAdapter::new(temp.path().to_path_buf()).unwrap();
-    writer.build(&[chunk(0, "quartz durable evidence", "codex")]).unwrap();
+    writer
+        .build(&[chunk(0, "quartz durable evidence", "codex")])
+        .unwrap();
     let expected_commit = writer.commit_id().clone();
     drop(writer);
     let reader = TantivyAdapter::open_existing(temp.path().to_path_buf()).unwrap();
@@ -74,7 +76,13 @@ fn existing_reader_never_initializes_a_missing_generation() {
 
     fs::remove_file(temp.path().join(TANTIVY_INDEX_DIR).join("meta.json")).unwrap();
     assert!(TantivyAdapter::open_existing(temp.path().to_path_buf()).is_err());
-    assert!(!temp.path().join(TANTIVY_INDEX_DIR).join("meta.json").exists());
+    assert!(
+        !temp
+            .path()
+            .join(TANTIVY_INDEX_DIR)
+            .join("meta.json")
+            .exists()
+    );
 }
 
 #[test]

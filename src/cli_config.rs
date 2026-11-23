@@ -1117,7 +1117,10 @@ pub(crate) fn describe_effective_config(
 fn run_config_show(json: bool) -> Result<()> {
     let retrieval = retrieval_inspection(&aicx::aicx_home::resolve()?);
     if json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({"retrieval": retrieval}))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"retrieval": retrieval}))?
+        );
         return Ok(());
     }
     eprintln!("  retrieval:   {retrieval}");

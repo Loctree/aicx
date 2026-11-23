@@ -179,15 +179,25 @@ impl SearchTelemetry {
         base: &mut PublishedHits,
     ) {
         self.record_base(base);
-        let Some(q) = self.quality.as_mut() else { return };
+        let Some(q) = self.quality.as_mut() else {
+            return;
+        };
         let hits = &mut base.filtered.outcome.results;
         q.rerank = rank(&config.reranker, query, hits).await;
-        let Setting::Configured(endpoint) = &config.decision else { return };
+        let Setting::Configured(endpoint) = &config.decision else {
+            return;
+        };
         let candidates = &hits[..hits.len().min(endpoint.max_candidates)];
         q.decision.candidate_count = candidates.len();
-        q.served_evidence = candidates.iter().enumerate().map(|(i, hit)| json!({
-            "id": decision::evidence_id(i), "path": hit.path, "label": hit.label
-        })).collect();
+        q.served_evidence = candidates
+            .iter()
+            .enumerate()
+            .map(|(i, hit)| {
+                json!({
+                    "id": decision::evidence_id(i), "path": hit.path, "label": hit.label
+                })
+            })
+            .collect();
         let start = Instant::now();
         let answer = decision::assess(endpoint, query, candidates).await;
         q.decision.assessment = q.decision.finish(start, answer);
@@ -195,8 +205,14 @@ impl SearchTelemetry {
             // Local evidence is conclusive only about the absence of candidates.
             q.decision.status = "skipped";
         }
-        let refined = q.decision.assessment.as_ref().and_then(|a| a.refined_query.as_deref());
-        let Some(refined) = refined.filter(|_| endpoint.max_refinements > 0) else { return };
+        let refined = q
+            .decision
+            .assessment
+            .as_ref()
+            .and_then(|a| a.refined_query.as_deref());
+        let Some(refined) = refined.filter(|_| endpoint.max_refinements > 0) else {
+            return;
+        };
         // Only the frozen retrieval and rerank stages run on the second pass.
         q.attempts = 1;
         let refined_query = refined.trim().to_owned();
@@ -204,7 +220,8 @@ impl SearchTelemetry {
         let mut frozen_scope = scope.clone();
         // An unavailable embedder already failed on this request. Refine on
         // the same published lexical backend without paying its timeout twice.
-        frozen_scope.embedder_cached_unavailable |= base.dense_failure == Some("embedder_unavailable");
+        frozen_scope.embedder_cached_unavailable |=
+            base.dense_failure == Some("embedder_unavailable");
         let result = tokio::task::spawn_blocking(move || frozen_scope.retrieve(&request)).await;
         let mut next = match result {
             Ok(Ok(next)) if !next.filtered.outcome.results.is_empty() => next,
@@ -221,11 +238,18 @@ impl SearchTelemetry {
                 return;
             }
         };
-        let next_rank = rank(&config.reranker, &refined_query, &mut next.filtered.outcome.results).await;
+        let next_rank = rank(
+            &config.reranker,
+            &refined_query,
+            &mut next.filtered.outcome.results,
+        )
+        .await;
         q.initial_rerank = Some(std::mem::replace(&mut q.rerank, next_rank));
         q.initial_dense_failure = self.dense_failure;
         self.dense_failure = match (self.dense_failure, next.dense_failure) {
-            (Some("embedder_unavailable"), Some("embedder_negative_cache")) => Some("embedder_unavailable"),
+            (Some("embedder_unavailable"), Some("embedder_negative_cache")) => {
+                Some("embedder_unavailable")
+            }
             (_, current) => current,
         };
         q.executed_query = refined_query;
@@ -241,20 +265,26 @@ impl SearchTelemetry {
             value["retrieval_quality"] = serde_json::to_value(quality)?;
         }
         if let Some(kind) = self.dense_failure {
-            value["dense_fallback"] = json!({"status": "failed", "failure_detail": kind, "backend": "lexical_tantivy"});
+            value["dense_fallback"] =
+                json!({"status": "failed", "failure_detail": kind, "backend": "lexical_tantivy"});
         }
         serde_json::to_string(&value)
     }
 
     pub fn retrieval(&self, base: RetrievalOutcome) -> RetrievalOutcome {
-        let Some(kind) = self.dense_failure else { return base };
-        RetrievalOutcome::from_evidence(RequestedMode::Hybrid, RetrievalEvidence {
-            executed_path: Some(base.executed_path),
-            examined_count: Some(base.examined_count),
-            matched_count: base.matched_count,
-            stale_evidence: base.stale_evidence,
-            fallback_reason: Some(format!("{kind}: served published Tantivy results")),
-        })
+        let Some(kind) = self.dense_failure else {
+            return base;
+        };
+        RetrievalOutcome::from_evidence(
+            RequestedMode::Hybrid,
+            RetrievalEvidence {
+                executed_path: Some(base.executed_path),
+                examined_count: Some(base.examined_count),
+                matched_count: base.matched_count,
+                stale_evidence: base.stale_evidence,
+                fallback_reason: Some(format!("{kind}: served published Tantivy results")),
+            },
+        )
     }
 
     pub fn print_summary(&self) {
@@ -262,20 +292,39 @@ impl SearchTelemetry {
             eprintln!("search: dense retrieval failed ({kind}); serving published Tantivy results");
         }
         if let Some(q) = &self.quality {
-            let details: Vec<_> = [&q.rerank.failure_detail, &q.decision.failure_detail, &q.refinement_failure]
-                .into_iter().filter_map(|s| s.as_deref()).collect();
-            let verdict = q.decision.assessment.as_ref().map(|a| match a.verdict {
-                decision::Verdict::Sufficient => "sufficient",
-                decision::Verdict::Insufficient => "insufficient",
-                decision::Verdict::Refine => "refine",
-            }).unwrap_or("unassessed");
-            eprintln!("retrieval quality: rerank={} decision={} verdict={} refinements={} {}",
-                q.rerank.status, q.decision.status, verdict, q.attempts, details.join(" / "));
+            let details: Vec<_> = [
+                &q.rerank.failure_detail,
+                &q.decision.failure_detail,
+                &q.refinement_failure,
+            ]
+            .into_iter()
+            .filter_map(|s| s.as_deref())
+            .collect();
+            let verdict = q
+                .decision
+                .assessment
+                .as_ref()
+                .map(|a| match a.verdict {
+                    decision::Verdict::Sufficient => "sufficient",
+                    decision::Verdict::Insufficient => "insufficient",
+                    decision::Verdict::Refine => "refine",
+                })
+                .unwrap_or("unassessed");
+            eprintln!(
+                "retrieval quality: rerank={} decision={} verdict={} refinements={} {}",
+                q.rerank.status,
+                q.decision.status,
+                verdict,
+                q.attempts,
+                details.join(" / ")
+            );
         }
     }
 
     fn reranked(&self) -> bool {
-        self.quality.as_ref().is_some_and(|q| q.rerank.status == "applied")
+        self.quality
+            .as_ref()
+            .is_some_and(|q| q.rerank.status == "applied")
     }
 
     pub fn finalize(
@@ -294,18 +343,31 @@ impl SearchTelemetry {
         }
     }
 
-    pub fn evidence(&self, query: &str, mut hits: Vec<FuzzyResult>, limit: usize) -> EvidenceReport {
-        let executed = self.quality.as_ref().map_or(query, |q| q.executed_query.as_str());
+    pub fn evidence(
+        &self,
+        query: &str,
+        mut hits: Vec<FuzzyResult>,
+        limit: usize,
+    ) -> EvidenceReport {
+        let executed = self
+            .quality
+            .as_ref()
+            .map_or(query, |q| q.executed_query.as_str());
         if !self.reranked() {
             return build_evidence_report(executed, hits, limit);
         }
         // Apply evidence scoring/dedup to the selected cross-encoder hits.
         // Keep evidence labels and scores, then restore the admitted order.
         hits.truncate(limit.max(1));
-        let order: std::collections::HashMap<_, _> = hits.iter().enumerate()
-            .map(|(i, h)| (h.path.clone(), i)).collect();
+        let order: std::collections::HashMap<_, _> = hits
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (h.path.clone(), i))
+            .collect();
         let mut report = build_evidence_report(executed, hits, limit);
-        report.items.sort_by_key(|item| order.get(&item.path).copied().unwrap_or(usize::MAX));
+        report
+            .items
+            .sort_by_key(|item| order.get(&item.path).copied().unwrap_or(usize::MAX));
         report
     }
 }
