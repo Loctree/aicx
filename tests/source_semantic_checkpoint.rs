@@ -1268,10 +1268,9 @@ fn malformed_or_future_manifest_cannot_serve_lexical_text() {
             &Default::default(),
         )
         .unwrap_err();
-        assert!(
-            error.reason().contains("invalid generation contract"),
-            "{error}"
-        );
+        // Schema and privacy admission are mandatory even when dense receipts
+        // are optional. Assert the stable error contract rather than prose.
+        assert_eq!(error.kind(), "retrieval_manifest_stale", "{error}");
         assert!(!error.allows_filesystem_fallback());
     }
     let mut legacy = original;
