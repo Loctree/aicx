@@ -2637,6 +2637,16 @@ pub struct PublishedHits {
     pub dense_failure: Option<&'static str>,
 }
 
+impl PublishedHits {
+    pub fn used_semantic(&self) -> bool {
+        !self
+            .filtered
+            .outcome
+            .backend_label
+            .starts_with(BACKEND_LEXICAL)
+    }
+}
+
 impl PublishedSearch {
     pub fn retrieve(&self, query: &str) -> Result<PublishedHits, SemanticError> {
         validate_search_frame_kind(self.frame)?;

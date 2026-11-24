@@ -689,25 +689,41 @@ reports the actual backend in `oracle_status`. Base read and privacy errors
 fail the request. A missing index permits the existing filesystem fallback.
 CLI `--no-semantic` requires a published lexical generation.
 
-`aicx search --rerank --decide --json "which migration did we choose?"` requests
-both optional stages. Each flag also works independently. In MCP, pass
-`rerank: true` or `decide: true` to `aicx_search`. An omitted flag uses the
-configured default. MCP accepts `false` to disable a stage for one request.
+Ordinary CLI and MCP search keep the results from the last successful stage.
+Tantivy serves lexical search. When the dense leg succeeds, the hybrid results
+can be reranked. The decision model runs after successful reranking. If it
+fails, the reranked hits remain available.
 
-Configure the full endpoint URL and model in `[retrieval.reranker]` or
-`[retrieval.decision]` in the same TOML used by AICX. Both default to
-`enabled = false`. The commented examples in `aicx config init` show the
-limits and optional `api_key_env` name. `aicx config show` and
+With no `[retrieval.reranker]` section, AICX checks the local model catalog on
+`127.0.0.1:12346`. It uses the model when the catalog advertises a single
+reranker. For another reranker, or to add a decision model, set the full endpoint
+URL and model in `[retrieval.reranker]` or `[retrieval.decision]`. The endpoint
+is active by default. Set `enabled = false` to turn the stage off. The commented
+examples in `aicx config init` show the limits and optional `api_key_env` name.
+`aicx config show` and
 `aicx config inspect` display each stage's status. Decision protocols are
-`responses` (default) and `chat_completions`. Set `max_refinements = 0`
-to receive the assessment without running a second search.
+`responses` (default), `chat_completions`, and `systemone`.
+Set `max_refinements = 0` to stop after the assessment.
+
+Intern-Decision uses `protocol = "systemone"` and the exact `/v1/systemone`
+URL and served model ID. AICX sends the query and up to eight snippets (768
+UTF-8 bytes each) as text. It requests one binary assessment for sufficiency
+and one for each snippet in the same call. It reports the calibrated
+`sufficiency_probability` and returns a sufficient assessment at 0.8 or
+above when at least one snippet scores above 0.5 for support. These initial
+cutoffs await calibration on AICX queries. The scorer never requests a
+second search.
 
 Reranking defaults to 12 candidates, with a configurable cap of 50. Requests
 send both `top_n` and `top_k` for servers using either limit name. The response
 must cover every submitted candidate; incomplete or invalid rankings preserve
 the earlier results and report a failed stage.
 
-Opted-in JSON responses include `retrieval_quality`. A missing configuration,
+Explicit `--rerank` or `--decide` requests a configured stage independently.
+For MCP, use `rerank: true` or `decide: true` to request a stage, and `false`
+to skip it for one request.
+
+JSON responses report optional-stage diagnostics in `retrieval_quality`. A missing configuration,
 unavailable endpoint, or malformed reply is reported alongside usable hits.
 The text view prints a stage summary to stderr. These flags apply to published
 search results, including `--evidence`. Passage lookup with `--session` rejects

@@ -131,10 +131,10 @@ timeout_secs = 30
 # [embedder.cloud.headers]
 # "X-Trace-Id" = "vetcoders-aicx"
 
-# Optional search stages. Configure a model and exact endpoint to use a CLI flag,
-# or set enabled = true to apply it by default to published-index searches.
+# Optional search stages. A configured endpoint is used when the previous
+# stage completes. Set enabled = false to opt out of the default for a stage.
+# With no reranker section, hybrid search discovers a local reranker on 12346.
 # [retrieval.reranker]
-# enabled = false
 # url = "http://127.0.0.1:12346/v1/rerank"
 # model = "galaxycore/Qwen3-Reranker-8B-MLX-4bit"
 # timeout_secs = 15
@@ -143,7 +143,7 @@ timeout_secs = 30
 # api_key_env = "AICX_RERANK_API_KEY"
 #
 # [retrieval.decision]
-# enabled = false
+# For Intern-Decision use protocol = "systemone" and the /v1/systemone URL.
 # protocol = "responses"
 # url = "http://127.0.0.1:8100/v1/responses"
 # model = "PocketAiHub/Qwen3.8-27B-Abliterated-MTPLX-Optimized-Speed"

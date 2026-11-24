@@ -74,6 +74,7 @@ impl Stage {
     fn new(setting: &Setting) -> Self {
         let (status, model, detail) = match setting {
             Setting::Disabled => ("disabled", None, None),
+            Setting::LocalReranker => ("skipped", None, None),
             Setting::Configured(e) => ("skipped", Some(e.model.clone()), None),
             Setting::Invalid(msg) => ("failed", None, Some(msg.clone())),
         };
@@ -84,6 +85,12 @@ impl Stage {
             candidate_count: 0,
             failure_detail: detail,
             assessment: None,
+        }
+    }
+
+    fn skip(&mut self, reason: &str) {
+        if self.status == "skipped" {
+            self.failure_detail = Some(reason.to_owned());
         }
     }
 
@@ -133,6 +140,22 @@ struct QualityReport {
     refinement_failure: Option<String>,
 }
 
+impl QualityReport {
+    fn new(config: &QualityConfig, query: &str) -> Self {
+        Self {
+            original_query: query.to_owned(),
+            executed_query: query.to_owned(),
+            attempts: 0,
+            rerank: Stage::new(&config.reranker),
+            decision: Stage::new(&config.decision),
+            served_evidence: Vec::new(),
+            initial_rerank: None,
+            initial_dense_failure: None,
+            refinement_failure: None,
+        }
+    }
+}
+
 /// Both renderers use this envelope. With no diagnostics, JSON passes through verbatim.
 pub struct SearchTelemetry {
     quality: Option<QualityReport>,
@@ -142,17 +165,9 @@ pub struct SearchTelemetry {
 impl SearchTelemetry {
     pub fn new(config: &QualityConfig, query: &str) -> Self {
         Self {
-            quality: config.active().then(|| QualityReport {
-                original_query: query.to_owned(),
-                executed_query: query.to_owned(),
-                attempts: 0,
-                rerank: Stage::new(&config.reranker),
-                decision: Stage::new(&config.decision),
-                served_evidence: Vec::new(),
-                initial_rerank: None,
-                initial_dense_failure: None,
-                refinement_failure: None,
-            }),
+            quality: config
+                .has_explicit_config()
+                .then(|| QualityReport::new(config, query)),
             dense_failure: None,
         }
     }
@@ -163,11 +178,8 @@ impl SearchTelemetry {
 
     pub fn skip(&mut self, reason: &str) {
         if let Some(q) = self.quality.as_mut() {
-            for stage in [&mut q.rerank, &mut q.decision] {
-                if stage.status == "skipped" {
-                    stage.failure_detail = Some(reason.to_owned());
-                }
-            }
+            q.rerank.skip(reason);
+            q.decision.skip(reason);
         }
     }
 
@@ -179,11 +191,39 @@ impl SearchTelemetry {
         base: &mut PublishedHits,
     ) {
         self.record_base(base);
-        let Some(q) = self.quality.as_mut() else {
+        let dense = base.used_semantic();
+        if !dense && !config.rerank_requested && !config.decision_requested {
+            self.skip("serving published Tantivy results");
             return;
-        };
+        }
         let hits = &mut base.filtered.outcome.results;
-        q.rerank = rank(&config.reranker, query, hits).await;
+        if !config.active() || (hits.is_empty() && self.quality.is_none()) {
+            return;
+        }
+        let q = self
+            .quality
+            .get_or_insert_with(|| QualityReport::new(config, query));
+        let local =
+            if dense && !hits.is_empty() && matches!(config.reranker, Setting::LocalReranker) {
+                Some(match http::discover_local_reranker().await {
+                    Ok(endpoint) => Setting::Configured(endpoint),
+                    Err(error) => Setting::Invalid(error.to_string()),
+                })
+            } else {
+                None
+            };
+        let reranker = if dense || config.rerank_requested {
+            let reranker = local.as_ref().unwrap_or(&config.reranker);
+            q.rerank = rank(reranker, query, hits).await;
+            reranker
+        } else {
+            q.rerank.skip("serving published Tantivy results");
+            &Setting::Disabled
+        };
+        if !config.decision_requested && q.rerank.status != "applied" {
+            q.decision.skip("reranking did not complete");
+            return;
+        }
         let Setting::Configured(endpoint) = &config.decision else {
             return;
         };
@@ -238,12 +278,19 @@ impl SearchTelemetry {
                 return;
             }
         };
-        let next_rank = rank(
-            &config.reranker,
-            &refined_query,
-            &mut next.filtered.outcome.results,
-        )
-        .await;
+        if dense && !next.used_semantic() {
+            q.refinement_failure = Some(format!(
+                "refinement served Tantivy ({})",
+                next.dense_failure
+                    .unwrap_or("semantic retrieval unavailable")
+            ));
+            return;
+        }
+        let next_rank = rank(reranker, &refined_query, &mut next.filtered.outcome.results).await;
+        if q.rerank.status == "applied" && next_rank.status != "applied" {
+            q.refinement_failure = next_rank.failure_detail;
+            return;
+        }
         q.initial_rerank = Some(std::mem::replace(&mut q.rerank, next_rank));
         q.initial_dense_failure = self.dense_failure;
         self.dense_failure = match (self.dense_failure, next.dense_failure) {

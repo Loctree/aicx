@@ -90,6 +90,16 @@ impl RetrievalQualityFixture {
     }
 
     fn search(&self, mcp: bool, rerank: bool, decide: bool, deep: bool) -> Value {
+        self.search_with(mcp, Some(rerank), Some(decide), Some(deep))
+    }
+
+    fn search_with(
+        &self,
+        mcp: bool,
+        rerank: Option<bool>,
+        decide: Option<bool>,
+        deep: Option<bool>,
+    ) -> Value {
         if !mcp {
             let mut cmd = self.command(env!("CARGO_BIN_EXE_aicx"));
             cmd.args([
@@ -106,7 +116,7 @@ impl RetrievalQualityFixture {
                 "--json",
             ]);
             for (enabled, flag) in [(rerank, "--rerank"), (decide, "--decide"), (deep, "--deep")] {
-                if enabled {
+                if enabled == Some(true) {
                     cmd.arg(flag);
                 }
             }
@@ -147,7 +157,13 @@ impl RetrievalQualityFixture {
             json!({"jsonrpc":"2.0","method":"notifications/initialized"})
         )
         .unwrap();
-        writeln!(input, "{}", json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"aicx_search","arguments":{"query":"Quartz","hours":0,"project":"fixture/quality","agent":"codex","limit":2,"slim":false,"rerank":rerank,"decide":decide,"deep":deep}}})).unwrap();
+        let mut args = json!({"query":"Quartz","hours":0,"project":"fixture/quality","agent":"codex","limit":2,"slim":false});
+        for (name, value) in [("rerank", rerank), ("decide", decide), ("deep", deep)] {
+            if let Some(value) = value {
+                args[name] = json!(value);
+            }
+        }
+        writeln!(input, "{}", json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"aicx_search","arguments":args}})).unwrap();
         let response = loop {
             match receiver.recv_timeout(Duration::from_secs(25)) {
                 Ok(value) if value["id"] == 2 => break Ok(value),
@@ -331,6 +347,145 @@ fn optional_missing_configuration_and_dense_failure_preserve_cli_and_mcp_base() 
         receipt,
         "search mutated published artifacts"
     );
+}
+
+#[cfg(feature = "cloud-embedder")]
+#[test]
+fn default_search_uses_the_highest_completed_layer_on_cli_and_mcp() {
+    let fixture = RetrievalQualityFixture::new();
+    let embedder = ModelServer::new(Arc::new(|request| {
+        let inputs = request["input"].as_array().map_or(1, Vec::len);
+        let data: Vec<_> = (0..inputs)
+            .map(|index| json!({"index":index,"embedding":[0.6,0.8]}))
+            .collect();
+        (200, json!({"data":data}))
+    }));
+    let embedder_config = format!(
+        "[embedder]\nbackend = \"cloud\"\n[embedder.cloud]\nurl = \"http://{}/v1/embeddings\"\nmodel = \"synthetic-embedder\"\ndimension = 2\n",
+        embedder.address,
+    );
+    let rerank_fails = Arc::new(AtomicBool::new(false));
+    let should_fail = rerank_fails.clone();
+    let reranker = ModelServer::new(Arc::new(move |request| {
+        if should_fail.load(Ordering::Relaxed) {
+            return (503, json!({}));
+        }
+        let count = request["documents"].as_array().unwrap().len();
+        let results: Vec<_> = (0..count)
+            .rev()
+            .map(|index| json!({"index":index,"relevance_score":(index + 1) as f64/count as f64}))
+            .collect();
+        (200, json!({"results":results}))
+    }));
+    let invalid_probability = Arc::new(AtomicBool::new(false));
+    let invalid_reply = invalid_probability.clone();
+    let decision = ModelServer::new(Arc::new(move |request| {
+        let state: Value = serde_json::from_str(request["state"].as_str().unwrap()).unwrap();
+        assert_eq!(state["query"], "Quartz");
+        let documents = state["documents"].as_array().unwrap();
+        let questions = request["questions"].as_object().unwrap();
+        assert_eq!(questions.len(), documents.len() + 1);
+        for doc in documents {
+            assert_eq!(questions[doc["id"].as_str().unwrap()]["type"], "noul");
+        }
+        let probability = if invalid_reply.load(Ordering::Relaxed) {
+            1.1
+        } else {
+            0.94
+        };
+        let answers: serde_json::Map<_, _> = questions.keys().map(|key| {
+            (key.clone(), json!({"type":"noul","noul":if key == "sufficient" { probability } else { 0.85 }}))
+        }).collect();
+        (200, json!({"model": request["model"], "answers": answers}))
+    }));
+    let reranker_config = reranker
+        .config("reranker", "")
+        .replace("enabled = true\n", "");
+    let decision_config = decision
+        .config("decision", "protocol = \"systemone\"\n")
+        .replace("enabled = true\n", "");
+    let both = format!("{embedder_config}{reranker_config}{decision_config}");
+    fixture.config(&both);
+    let search = |mcp| fixture.search_with(mcp, None, None, None);
+    for mcp in [false, true] {
+        let lexical = search(mcp);
+        assert_base(&lexical);
+        assert_eq!(
+            lexical["oracle_status"]["retrieval"]["executed_path"],
+            "lexical_only"
+        );
+        assert_eq!(lexical["retrieval_quality"]["rerank"]["status"], "skipped");
+    }
+    assert!(reranker.requests.lock().unwrap().is_empty());
+    assert!(decision.requests.lock().unwrap().is_empty());
+
+    let built = fixture
+        .command(env!("CARGO_BIN_EXE_aicx"))
+        .args(["index", "--semantic", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    for mcp in [false, true] {
+        fixture.config(&format!(
+            "{embedder_config}[retrieval.reranker]\nenabled = false\n{decision_config}"
+        ));
+        let hybrid = search(mcp);
+        assert_base(&hybrid);
+        assert_eq!(
+            hybrid["oracle_status"]["retrieval"]["executed_path"],
+            "hybrid_fusion"
+        );
+        assert_eq!(hybrid["retrieval_quality"]["decision"]["status"], "skipped");
+
+        fixture.config(&both);
+        rerank_fails.store(true, Ordering::Relaxed);
+        let fallback = search(mcp);
+        assert_eq!(fallback["items"], hybrid["items"]);
+        assert_eq!(fallback["retrieval_quality"]["rerank"]["status"], "failed");
+        assert_eq!(
+            fallback["retrieval_quality"]["decision"]["status"],
+            "skipped"
+        );
+
+        fixture.config(&format!("{embedder_config}{reranker_config}"));
+        rerank_fails.store(false, Ordering::Relaxed);
+        let ranked = search(mcp);
+        assert_eq!(ranked["retrieval_quality"]["rerank"]["status"], "applied");
+        assert_eq!(
+            ranked["retrieval_quality"]["decision"]["status"],
+            "disabled"
+        );
+
+        fixture.config(&both);
+        invalid_probability.store(false, Ordering::Relaxed);
+        let assessed = search(mcp);
+        assert_eq!(assessed["items"], ranked["items"]);
+        assert_eq!(
+            assessed["retrieval_quality"]["decision"]["status"],
+            "applied"
+        );
+        assert_eq!(
+            assessed["retrieval_quality"]["decision"]["sufficiency_probability"],
+            0.94
+        );
+        assert_eq!(
+            assessed["retrieval_quality"]["decision"]["verdict"],
+            "sufficient"
+        );
+
+        invalid_probability.store(true, Ordering::Relaxed);
+        let rejected = search(mcp);
+        assert_eq!(rejected["items"], ranked["items"]);
+        assert_eq!(
+            rejected["retrieval_quality"]["decision"]["status"],
+            "failed"
+        );
+    }
+    assert_eq!(decision.requests.lock().unwrap().len(), 4);
 }
 
 #[test]

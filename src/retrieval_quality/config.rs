@@ -12,12 +12,15 @@ use anyhow::{Result, anyhow, bail};
 use reqwest::Url;
 use serde::Deserialize;
 
+pub(super) const LOCAL_RERANKER_API: &str = "http://127.0.0.1:12346/v1";
+
 #[derive(Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Protocol {
     #[default]
     Responses,
     ChatCompletions,
+    Systemone,
 }
 
 #[derive(Default, Deserialize)]
@@ -50,6 +53,7 @@ pub(super) struct Endpoint {
 
 pub(super) enum Setting {
     Disabled,
+    LocalReranker,
     Configured(Endpoint),
     Invalid(String),
 }
@@ -69,6 +73,7 @@ impl Setting {
                 serde_json::json!({"enabled": true, "model": endpoint.model})
             }
             Self::Disabled => serde_json::json!({"enabled": false}),
+            Self::LocalReranker => serde_json::json!({"enabled": true, "mode": "auto_local"}),
             Self::Invalid(detail) => {
                 serde_json::json!({"status": "failed", "failure_detail": detail})
             }
@@ -79,6 +84,8 @@ impl Setting {
 pub struct QualityConfig {
     pub(super) reranker: Setting,
     pub(super) decision: Setting,
+    pub(super) rerank_requested: bool,
+    pub(super) decision_requested: bool,
 }
 
 fn read_config(home: &Path) -> Result<Option<toml::Value>> {
@@ -138,13 +145,17 @@ fn endpoint(
                 .ok_or_else(|| anyhow!("{label}.enabled must be boolean"))
         })
         .transpose()?;
-    if !requested.unwrap_or(enabled.unwrap_or(false)) {
+    if !requested.unwrap_or(enabled.unwrap_or(true)) {
         return Ok(None);
     }
     let cfg: Table = section
         .clone()
         .try_into()
         .map_err(|_| anyhow!("invalid {label} fields; check protocol, limits and value types"))?;
+    configured_endpoint(cfg, &label, name == "decision").map(Some)
+}
+
+fn configured_endpoint(cfg: Table, label: &str, decision: bool) -> Result<Endpoint> {
     let url =
         Url::parse(&cfg.url).map_err(|_| anyhow!("set {label}.url to a complete HTTP endpoint"))?;
     if !matches!(url.scheme(), "http" | "https")
@@ -166,13 +177,15 @@ fn endpoint(
     {
         bail!("{label}.api_key_env must name an environment variable");
     }
-    let decision = name == "decision";
-    let (timeout, ceiling, candidates, candidate_cap, bytes) = if decision {
+    let systemone = decision && matches!(cfg.protocol, Protocol::Systemone);
+    let (timeout, ceiling, candidates, candidate_cap, bytes) = if systemone {
+        (5, 180, 8, 8, 768)
+    } else if decision {
         (30, 180, 12, 12, 2048)
     } else {
         (15, 120, 12, 50, 4096)
     };
-    Ok(Some(Endpoint {
+    Ok(Endpoint {
         url,
         model: model.to_owned(),
         api_key_env: cfg.api_key_env,
@@ -184,30 +197,60 @@ fn endpoint(
         max_doc_bytes: cfg.max_doc_bytes.unwrap_or(bytes).clamp(1, bytes),
         protocol: cfg.protocol,
         max_output_tokens: cfg.max_output_tokens.unwrap_or(512).clamp(1, 2048),
-        max_refinements: cfg.max_refinements.unwrap_or(1).min(1),
-    }))
+        max_refinements: if systemone {
+            0
+        } else {
+            cfg.max_refinements.unwrap_or(1).min(1)
+        },
+    })
+}
+
+pub(super) fn local_reranker(model: String) -> Result<Endpoint> {
+    configured_endpoint(
+        Table {
+            url: format!("{LOCAL_RERANKER_API}/rerank"),
+            model,
+            timeout_secs: Some(5),
+            ..Table::default()
+        },
+        "local reranker",
+        false,
+    )
 }
 
 impl QualityConfig {
     pub fn load(home: &Path, rerank: Option<bool>, decide: Option<bool>) -> Self {
         let file = read_config(home);
-        let resolve = |name, requested| match &file {
-            Ok(file) => Setting::resolve(endpoint(
-                file.as_ref().and_then(|v| v.get("retrieval")),
-                name,
-                requested,
-            )),
+        let resolve = |name: &str, requested: Option<bool>| match &file {
+            Ok(file) => {
+                let retrieval = file.as_ref().and_then(|v| v.get("retrieval"));
+                if name == "reranker"
+                    && requested.is_none()
+                    && retrieval.and_then(|v| v.get(name)).is_none()
+                {
+                    Setting::LocalReranker
+                } else {
+                    Setting::resolve(endpoint(retrieval, name, requested))
+                }
+            }
             Err(_) if requested == Some(false) => Setting::Disabled,
             Err(err) => Setting::Invalid(err.to_string()),
         };
         Self {
             reranker: resolve("reranker", rerank),
             decision: resolve("decision", decide),
+            rerank_requested: rerank == Some(true),
+            decision_requested: decide == Some(true),
         }
     }
 
     pub fn active(&self) -> bool {
         !matches!(self.reranker, Setting::Disabled) || !matches!(self.decision, Setting::Disabled)
+    }
+
+    pub(super) fn has_explicit_config(&self) -> bool {
+        !matches!(self.reranker, Setting::Disabled | Setting::LocalReranker)
+            || !matches!(self.decision, Setting::Disabled)
     }
 
     /// Inspection never resolves bearer credentials or displays endpoint URLs.
