@@ -143,10 +143,30 @@ impl HybridIndex {
         dense_chunks: &[DenseChunkRef],
         source_hash: &str,
     ) -> Result<()> {
+        self.build_generation(lexical_chunks, source_hash, |dense| {
+            dense.build(dense_chunks)
+        })
+    }
+
+    /// Finish a generation whose dense payload was built by the caller.
+    pub fn build_with_prebuilt_dense(
+        &mut self,
+        lexical_chunks: &[ChunkRef],
+        source_hash: &str,
+    ) -> Result<()> {
+        self.build_generation(lexical_chunks, source_hash, |_| Ok(()))
+    }
+
+    fn build_generation(
+        &mut self,
+        lexical_chunks: &[ChunkRef],
+        source_hash: &str,
+        build_dense: impl FnOnce(&mut dyn DenseIndex) -> Result<()>,
+    ) -> Result<()> {
         let started = Manifest::now_utc();
         let timer = Instant::now();
         let lexical_commit_id = self.lexical.build(lexical_chunks)?;
-        self.dense.build(dense_chunks)?;
+        build_dense(self.dense.as_mut())?;
         let completed = Manifest::now_utc();
 
         self.manifest = Some(Manifest {

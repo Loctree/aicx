@@ -9,11 +9,12 @@
 //! reads vector bytes straight off the map; full metadata is decoded only for
 //! the final top-`limit` rows.
 
+use std::borrow::Borrow;
 use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::path::{Component, Path, PathBuf};
 
@@ -274,13 +275,100 @@ impl MmapDenseAdapter {
         Ok(score)
     }
 
-    fn write_chunks(&self, chunks: &[DenseChunkRef]) -> Result<()> {
+    /// Write sequential rows without retaining the vector or metadata payloads.
+    pub fn build_from_rows<T: Borrow<DenseChunkRef>>(
+        &mut self,
+        count: usize,
+        rows: impl IntoIterator<Item = Result<T>>,
+    ) -> Result<()> {
+        let tmp_path = temporary_path(&self.path)?;
+        let staged = (|| {
+            if let Some(parent) = self.path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("create mmap dense parent {}", parent.display()))?;
+            }
+            let vectors = File::create(&tmp_path)
+                .with_context(|| format!("create mmap dense tmp {}", tmp_path.display()))?;
+            let metadata = fs::OpenOptions::new().write(true).open(&tmp_path)?;
+            self.write_rows(vectors, metadata, count, rows)
+        })();
+        if let Err(error) = staged {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(error);
+        }
+        // Windows cannot replace the file while the old mapping is open.
+        let old_count = self.header.count;
+        self.data = OwnedBytes::empty();
+        self.refs.clear();
+        self.header.count = 0;
+        if let Err(error) = fs::rename(&tmp_path, &self.path) {
+            let _ = fs::remove_file(&tmp_path);
+            if old_count != 0
+                && let Ok(previous) = Self::open(
+                    &self.path,
+                    self.header.dim,
+                    self.header.distance,
+                    Some(self.header.source_hash),
+                )
+            {
+                *self = previous;
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "commit mmap dense file {} -> {}",
+                    tmp_path.display(),
+                    self.path.display()
+                )
+            });
+        }
+        *self = Self::open(
+            &self.path,
+            self.header.dim,
+            self.header.distance,
+            Some(self.header.source_hash),
+        )?;
+        Ok(())
+    }
+
+    fn write_rows<T: Borrow<DenseChunkRef>>(
+        &self,
+        vector_file: File,
+        metadata_file: File,
+        count: usize,
+        rows: impl IntoIterator<Item = Result<T>>,
+    ) -> Result<()> {
         if self.header.dim == 0 {
             bail!("mmap dense dimension must be non-zero");
         }
-        let mut metadata_blobs = Vec::with_capacity(chunks.len());
-        let mut metadata_len = 0usize;
-        for chunk in chunks {
+        let refs_len = checked_mul(count, MMAP_METADATA_REF_LEN, "metadata refs length")?;
+        let vectors_len = checked_mul(
+            checked_mul(count, self.header.dim, "vector component count")?,
+            size_of::<f32>(),
+            "vectors length",
+        )?;
+        let refs_offset = MMAP_DENSE_HEADER_LEN;
+        let vectors_offset = checked_add(refs_offset, refs_len, "vectors offset")?;
+        let metadata_offset = checked_add(vectors_offset, vectors_len, "metadata offset")?;
+
+        // Independent handles write disjoint ranges of the same staged file.
+        let mut vectors = BufWriter::with_capacity(128 * 1024, vector_file);
+        vectors.seek(SeekFrom::Start(usize_to_u64(
+            vectors_offset,
+            "vectors offset",
+        )?))?;
+        let mut metadata = BufWriter::with_capacity(128 * 1024, metadata_file);
+        metadata.seek(SeekFrom::Start(usize_to_u64(
+            metadata_offset,
+            "metadata offset",
+        )?))?;
+
+        let mut refs = Vec::with_capacity(count);
+        let mut metadata_len = 0;
+        let mut blob = Vec::new();
+        for row in rows {
+            anyhow::ensure!(refs.len() < count, "more dense rows than declared");
+            let row = row?;
+            let chunk = row.borrow();
             if chunk.embedding.len() != self.header.dim {
                 bail!(
                     "build: chunk {} has dim {}, adapter dim {}",
@@ -295,11 +383,15 @@ impl MmapDenseAdapter {
                     chunk.chunk.id
                 );
             }
-            let blob = serde_json::to_vec(&StoredMetadata {
-                chunk_id: chunk.chunk.id.clone(),
-                source_path: chunk.chunk.source_path.clone(),
-                metadata: chunk.chunk.metadata.clone(),
-            })?;
+            blob.clear();
+            serde_json::to_writer(
+                &mut blob,
+                &StoredMetadata {
+                    chunk_id: chunk.chunk.id.clone(),
+                    source_path: chunk.chunk.source_path.clone(),
+                    metadata: chunk.chunk.metadata.clone(),
+                },
+            )?;
             if blob.is_empty() || blob.len() > MAX_METADATA_RECORD_BYTES {
                 bail!(
                     "build: chunk {} metadata size {} is outside 1..={MAX_METADATA_RECORD_BYTES}",
@@ -307,20 +399,19 @@ impl MmapDenseAdapter {
                     blob.len()
                 );
             }
+            refs.push(MetadataRef {
+                offset: metadata_len,
+                len: blob.len(),
+            });
             metadata_len = checked_add(metadata_len, blob.len(), "metadata payload length")?;
-            metadata_blobs.push(blob);
+            metadata.write_all(&blob)?;
+            for value in &chunk.embedding {
+                vectors.write_all(&value.to_le_bytes())?;
+            }
         }
-
-        let count = chunks.len();
-        let refs_len = checked_mul(count, MMAP_METADATA_REF_LEN, "metadata refs length")?;
-        let vectors_len = checked_mul(
-            checked_mul(count, self.header.dim, "vector component count")?,
-            size_of::<f32>(),
-            "vectors length",
-        )?;
-        let refs_offset = MMAP_DENSE_HEADER_LEN;
-        let vectors_offset = checked_add(refs_offset, refs_len, "vectors offset")?;
-        let metadata_offset = checked_add(vectors_offset, vectors_len, "metadata offset")?;
+        anyhow::ensure!(refs.len() == count, "fewer dense rows than declared");
+        metadata.flush()?;
+        drop(metadata);
         let file_len = checked_add(metadata_offset, metadata_len, "file length")?;
         let header = Header {
             dim: self.header.dim,
@@ -334,45 +425,21 @@ impl MmapDenseAdapter {
             metadata_offset,
             metadata_len,
         };
-
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create mmap dense parent {}", parent.display()))?;
-        }
-        let tmp_path = temporary_path(&self.path)?;
-        let file = File::create(&tmp_path)
-            .with_context(|| format!("create mmap dense tmp {}", tmp_path.display()))?;
-        let mut writer = BufWriter::new(file);
-        writer.write_all(&encode_header(&header, file_len)?)?;
-
-        let mut metadata_cursor = 0usize;
-        for blob in &metadata_blobs {
+        vectors.seek(SeekFrom::Start(0))?;
+        vectors.write_all(&encode_header(&header, file_len)?)?;
+        for reference in refs {
             write_u64(
-                &mut writer,
-                usize_to_u64(metadata_cursor, "metadata offset")?,
+                &mut vectors,
+                usize_to_u64(reference.offset, "metadata offset")?,
             )?;
-            write_u32(&mut writer, usize_to_u32(blob.len(), "metadata length")?)?;
-            write_u32(&mut writer, 0)?;
-            metadata_cursor += blob.len();
+            write_u32(
+                &mut vectors,
+                usize_to_u32(reference.len, "metadata length")?,
+            )?;
+            write_u32(&mut vectors, 0)?;
         }
-        for chunk in chunks {
-            for value in &chunk.embedding {
-                writer.write_all(&value.to_le_bytes())?;
-            }
-        }
-        for blob in metadata_blobs {
-            writer.write_all(&blob)?;
-        }
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
-        drop(writer);
-        fs::rename(&tmp_path, &self.path).with_context(|| {
-            format!(
-                "commit mmap dense file {} -> {}",
-                tmp_path.display(),
-                self.path.display()
-            )
-        })?;
+        vectors.flush()?;
+        vectors.get_ref().sync_all()?;
         Ok(())
     }
 
@@ -511,19 +578,7 @@ impl DenseIndex for MmapDenseAdapter {
     }
 
     fn build(&mut self, chunks: &[DenseChunkRef]) -> Result<()> {
-        // Drop an existing mapping before atomic replacement. This matters on
-        // Windows, where a mapped file cannot be renamed over in place.
-        self.data = OwnedBytes::empty();
-        self.refs.clear();
-        self.header.count = 0;
-        self.write_chunks(chunks)?;
-        *self = Self::open(
-            &self.path,
-            self.header.dim,
-            self.header.distance,
-            Some(self.header.source_hash),
-        )?;
-        Ok(())
+        self.build_from_rows(chunks.len(), chunks.iter().map(Ok))
     }
 
     fn insert(&mut self, chunk: &DenseChunkRef) -> Result<()> {

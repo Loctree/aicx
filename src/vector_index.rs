@@ -1080,7 +1080,7 @@ pub fn publish_source_hybrid_generation_with_contract(
 ) -> Result<aicx_retrieve::Manifest> {
     publish_source_hybrid_generation_checked(
         chunks,
-        dense_chunks,
+        dense_chunks.iter().map(Ok),
         source_fingerprint,
         fingerprint,
         input_contract,
@@ -1097,9 +1097,11 @@ pub fn publish_source_hybrid_generation_with_contract(
     )
 }
 
-pub(crate) fn publish_source_hybrid_generation_checked(
+pub(crate) fn publish_source_hybrid_generation_checked<
+    T: std::borrow::Borrow<aicx_retrieve::DenseChunkRef>,
+>(
     chunks: &[aicx_retrieve::ChunkRef],
-    dense_chunks: &[aicx_retrieve::DenseChunkRef],
+    dense_rows: impl ExactSizeIterator<Item = Result<T>>,
     source_fingerprint: &str,
     fingerprint: &aicx_retrieve::EmbedderFingerprint,
     input_contract: Option<&str>,
@@ -1113,47 +1115,38 @@ pub(crate) fn publish_source_hybrid_generation_checked(
     if chunks.is_empty() {
         anyhow::bail!("cannot publish an empty source hybrid generation");
     }
+    if fingerprint.dim == 0 {
+        anyhow::bail!("embedder dimension must be non-zero for --semantic publish");
+    }
+    let started = Manifest::now_utc();
+    let timer = std::time::Instant::now();
     let lexical_ids: std::collections::HashSet<_> = chunks.iter().map(|c| c.id.as_str()).collect();
     let mut covered = std::collections::HashSet::new();
     let mut dense_ids = std::collections::HashSet::new();
-    for dense in dense_chunks {
+    let count = dense_rows.len();
+    let dense_rows = dense_rows.enumerate().map(|(idx, row)| {
+        let row = row?;
+        let dense = row.borrow();
         let parent = dense
             .chunk
             .metadata
             .get("parent_chunk_id")
             .and_then(|v| v.as_str())
             .unwrap_or(&dense.chunk.id);
+        let parent = lexical_ids
+            .get(parent)
+            .context("dense passage refers to an absent lexical session")?;
         anyhow::ensure!(
-            lexical_ids.contains(parent),
-            "dense passage refers to an absent lexical session"
-        );
-        anyhow::ensure!(
-            dense_ids.insert(&dense.chunk.id),
+            dense_ids.insert(dense.chunk.id.clone()),
             "duplicate dense passage identity"
         );
-        covered.insert(parent);
-    }
-    anyhow::ensure!(
-        covered == lexical_ids,
-        "hybrid publish requires dense coverage of every lexical session"
-    );
-    if fingerprint.dim == 0 {
-        anyhow::bail!("embedder dimension must be non-zero for --semantic publish");
-    }
-    for (idx, dense) in dense_chunks.iter().enumerate() {
-        if dense.embedding.len() != fingerprint.dim {
-            anyhow::bail!(
-                "dense chunk {idx} dim {} != embedder dim {}",
-                dense.embedding.len(),
-                fingerprint.dim
-            );
-        }
+        covered.insert(*parent);
         anyhow::ensure!(
-            dense.embedding.iter().all(|v| v.is_finite())
-                && dense.embedding.iter().any(|v| *v != 0.0),
+            dense.embedding.iter().any(|v| *v != 0.0),
             "invalid dense vector at passage {idx}"
         );
-    }
+        Ok(row)
+    });
 
     let hybrid_root = hybrid_root_dir(None)?;
     let generation_dir = hybrid_root
@@ -1164,23 +1157,30 @@ pub(crate) fn publish_source_hybrid_generation_checked(
 
     let distance = distance_from_label(&fingerprint.distance)?;
     let lexical = Box::new(TantivyAdapter::new(generation_dir.clone())?);
-    let dense = Box::new(MmapDenseAdapter::create(
+    let mut dense = MmapDenseAdapter::create(
         generation_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME),
         fingerprint.dim,
         distance,
         aicx_retrieve::source_hash_bytes(source_fingerprint),
-    ));
+    );
+    dense.build_from_rows(count, dense_rows)?;
+    anyhow::ensure!(
+        covered == lexical_ids,
+        "hybrid publish requires dense coverage of every lexical session"
+    );
     let fusion = Box::new(ReciprocalRankFusion::default());
     let mut hybrid = HybridIndex::new(
         lexical,
-        dense,
+        Box::new(dense),
         fusion,
         generation_dir.clone(),
         fingerprint.clone(),
     );
     hybrid.set_writer_identity(env!("CARGO_PKG_VERSION"), crate::BUILD_VERSION);
-    hybrid.build_hybrid(chunks, dense_chunks, source_fingerprint)?;
+    hybrid.build_with_prebuilt_dense(chunks, source_fingerprint)?;
     let mut manifest = hybrid.commit()?.clone();
+    manifest.build_started_at = started;
+    manifest.build_wall_seconds = timer.elapsed().as_secs();
     manifest.semantic_input_contract = input_contract.map(str::to_string);
     manifest.source_policy_fingerprint = policy_fingerprint.map(str::to_string);
     if input_contract.is_some() {

@@ -59,6 +59,38 @@ fn round_trip_maps_read_only_and_preserves_header_contract() {
 }
 
 #[test]
+fn streamed_build_preserves_the_previous_mapping_when_a_late_row_fails() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("dense.mmap");
+    let mut adapter = MmapDenseAdapter::create(&path, 4096, Distance::Cosine, SOURCE_HASH);
+    adapter
+        .build_from_rows(
+            16,
+            (0..16).map(|n| Ok(chunk(n.to_string(), "alpha", vec![1.0; 4096]))),
+        )
+        .unwrap();
+    let previous = fs::read(&path).unwrap();
+
+    let rows = (0..16).map(|n| {
+        if n == 15 {
+            anyhow::bail!("checkpoint row unavailable");
+        }
+        Ok(chunk(n.to_string(), "alpha", vec![2.0; 4096]))
+    });
+    assert!(adapter.build_from_rows(16, rows).is_err());
+    assert_eq!(fs::read(&path).unwrap(), previous);
+    assert_eq!(adapter.count(), 16);
+    assert!(!dir.path().join("dense.mmap.tmp").exists());
+    assert_eq!(
+        adapter
+            .query(&vec![1.0; 4096], 2, &FilterSet::default())
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
 fn every_structural_truncation_boundary_fails_closed() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("dense.mmap");
