@@ -179,7 +179,7 @@ fn configured_endpoint(cfg: Table, label: &str, decision: bool) -> Result<Endpoi
     }
     let systemone = decision && matches!(cfg.protocol, Protocol::Systemone);
     let (timeout, ceiling, candidates, candidate_cap, bytes) = if systemone {
-        (5, 180, 8, 8, 768)
+        (5, 180, 4, 8, 4096)
     } else if decision {
         (30, 180, 12, 12, 2048)
     } else {
@@ -210,7 +210,8 @@ pub(super) fn local_reranker(model: String) -> Result<Endpoint> {
         Table {
             url: format!("{LOCAL_RERANKER_API}/rerank"),
             model,
-            timeout_secs: Some(5),
+            timeout_secs: Some(30),
+            max_candidates: Some(50),
             ..Table::default()
         },
         "local reranker",

@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow, ensure};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{bounded, config::Endpoint, document, http};
+use super::{checked_query, config::Endpoint, document, http};
 use crate::rank::FuzzyResult;
 
 #[derive(Deserialize)]
@@ -28,11 +28,11 @@ pub(super) async fn reorder(
     let documents: Vec<_> = pool
         .iter()
         .map(|hit| document(hit, endpoint.max_doc_bytes))
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     let response: Response = http::post(
         endpoint,
         &json!({
-            "model": endpoint.model, "query": bounded(query, super::QUERY_BYTES),
+            "model": endpoint.model, "query": checked_query(query)?,
             // Reranker servers use both names for the same requested limit.
             // MLX ignores top_n and otherwise silently returns only ten rows.
             "documents": documents, "top_n": pool.len(), "top_k": pool.len(),

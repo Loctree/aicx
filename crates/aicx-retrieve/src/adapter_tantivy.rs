@@ -840,6 +840,10 @@ fn is_boilerplate_excerpt(candidate: &str) -> bool {
             "os version:",
             "shell:",
             "workspace path:",
+            "primary input file:",
+            "working directory:",
+            "repo:",
+            "repository:",
             "current_date:",
             "timezone:",
             "run_id:",
@@ -1240,6 +1244,14 @@ impl LexicalIndex for TantivyAdapter {
             hit.rank = rank;
         }
         Ok(hits)
+    }
+
+    fn query_snippets(
+        &self,
+        query: &str,
+        chunk_ids: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        TantivyAdapter::query_snippets(self, query, chunk_ids)
     }
 
     fn commit_id(&self) -> &LexicalCommitId {
@@ -2080,6 +2092,21 @@ mod swap_tests {
         assert_eq!(
             lines,
             vec!["Decision: W2-B-4c must own routing strzałek for the top tabs."]
+        );
+    }
+
+    #[test]
+    fn query_context_ignores_file_and_repository_metadata() {
+        let body = [
+            "Primary input file: /tmp/resume-aicx-loctree-map-code.md",
+            "Repo: /tmp/loctree/aicx",
+            "Decision: loctree/aicx owns the semantic code map contract.",
+        ]
+        .join("\n");
+        let lines = query_context_lines(&body, "loctree aicx semantic map");
+        assert_eq!(
+            lines,
+            vec!["Decision: loctree/aicx owns the semantic code map contract."]
         );
     }
 }

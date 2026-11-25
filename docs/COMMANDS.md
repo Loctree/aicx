@@ -706,7 +706,7 @@ examples in `aicx config init` show the limits and optional `api_key_env` name.
 Set `max_refinements = 0` to stop after the assessment.
 
 Intern-Decision uses `protocol = "systemone"` and the exact `/v1/systemone`
-URL and served model ID. AICX sends the query and up to eight snippets (768
+URL and served model ID. AICX sends the query and up to four snippets (4096
 UTF-8 bytes each) as text. It requests one binary assessment for sufficiency
 and one for each snippet in the same call. It reports the calibrated
 `sufficiency_probability` and returns a sufficient assessment at 0.8 or
@@ -714,7 +714,8 @@ above when at least one snippet scores above 0.5 for support. These initial
 cutoffs await calibration on AICX queries. The scorer never requests a
 second search.
 
-Reranking defaults to 12 candidates, with a configurable cap of 50. Requests
+Reranking defaults to 12 candidates, with a configurable cap of 50. The
+automatically discovered local reranker uses the full 50-candidate cap. Requests
 send both `top_n` and `top_k` for servers using either limit name. The response
 must cover every submitted candidate; incomplete or invalid rankings preserve
 the earlier results and report a failed stage.
@@ -727,7 +728,12 @@ JSON responses report optional-stage diagnostics in `retrieval_quality`. A missi
 unavailable endpoint, or malformed reply is reported alongside usable hits.
 The text view prints a stage summary to stderr. These flags apply to published
 search results, including `--evidence`. Passage lookup with `--session` rejects
-explicit quality flags. Filesystem fallback reports requested stages as skipped.
+explicit quality flags. Model input uses complete focused passages. A document that exceeds the
+configured model budget produces a stage diagnostic instead of silent
+truncation. Exact project names in the query take precedence over the
+cross-encoder order, and the model ranks results within that project scope.
+
+Filesystem fallback reports requested stages as skipped.
 
 `--session` is the last-mile passage route after a session-level hit. It reads
 the cached whole-session extract when present; otherwise it parses the live

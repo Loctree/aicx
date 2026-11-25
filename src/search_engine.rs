@@ -1142,7 +1142,10 @@ fn rank_lexical_candidates(query: &str, results: &mut [FuzzyResult]) {
     });
 }
 
-fn lexical_result_evidence_class(query: &str, result: &FuzzyResult) -> LexicalEvidenceClass {
+pub(crate) fn lexical_result_evidence_class(
+    query: &str,
+    result: &FuzzyResult,
+) -> LexicalEvidenceClass {
     if result.density.is_sign_negative() {
         return LexicalEvidenceClass::Noise;
     }
@@ -1730,10 +1733,17 @@ fn try_semantic_search_native(
         saturated: query_result.retrieval_outcome.completeness == RetrievalCompleteness::Partial,
     };
     let hits = query_result.hits;
+    let chunk_ids: Vec<String> = hits.iter().map(|hit| hit.chunk_id.clone()).collect();
+    // A legacy dense generation stores one vector and one preview per session.
+    // Recover the actual lexical match from the same committed generation so
+    // neither the human nor an optional model has to judge the preamble.
+    let query_context = hybrid
+        .query_snippets(query, &chunk_ids)
+        .map_err(|err| index_query_error(&path, err))?;
 
     let retrieval_status = manifest.as_ref().map(HybridRetrievalStatus::from);
     let scanned = boundary.examined;
-    let results: Vec<FuzzyResult> = hits
+    let mut results: Vec<FuzzyResult> = hits
         .into_iter()
         .take(limit)
         .map(|h| {
@@ -1769,6 +1779,18 @@ fn try_semantic_search_native(
             }
         })
         .collect();
+    for (result, chunk_id) in results.iter_mut().zip(chunk_ids) {
+        let Some(lines) = query_context.get(&chunk_id) else {
+            continue;
+        };
+        let mut focused = result.clone();
+        focused.matched_lines.clone_from(lines);
+        if lexical_result_evidence_class(query, &focused)
+            > lexical_result_evidence_class(query, result)
+        {
+            *result = focused;
+        }
+    }
 
     Ok((
         SemanticOutcome {
@@ -2691,7 +2713,10 @@ impl PublishedSearch {
             "embedder_negative_cache"
         } else {
             match retrieve(&self.filters) {
-                Ok(filtered) => {
+                Ok(mut filtered) => {
+                    // Semantic retrieval augments the validated lexical pool;
+                    // it must not hide a strong Tantivy answer from reranking.
+                    merge_lexical_candidates(&base.outcome.results, &mut filtered.outcome.results);
                     return Ok(PublishedHits {
                         filtered,
                         dense_failure: None,
@@ -2705,6 +2730,31 @@ impl PublishedSearch {
             dense_failure: Some(failure),
         })
     }
+}
+
+fn merge_lexical_candidates(lexical: &[FuzzyResult], hybrid: &mut Vec<FuzzyResult>) {
+    let capacity = hybrid.len().max(lexical.len());
+    for candidate in lexical {
+        let existing =
+            hybrid
+                .iter_mut()
+                .find(|fused| match (&fused.session_id, &candidate.session_id) {
+                    (Some(a), Some(b)) if !a.is_empty() && !b.is_empty() => {
+                        a == b && fused.project == candidate.project
+                    }
+                    _ => fused.path == candidate.path && fused.project == candidate.project,
+                });
+        if let Some(fused) = existing {
+            if fused.matched_lines.is_empty() && !candidate.matched_lines.is_empty() {
+                fused.matched_lines.clone_from(&candidate.matched_lines);
+            }
+        } else {
+            hybrid.push(candidate.clone());
+        }
+    }
+    hybrid.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
+    *hybrid = dedupe_semantic_results(std::mem::take(hybrid));
+    hybrid.truncate(capacity);
 }
 
 /// Merge an optional `filter_pushdown` diagnostic into a JSON payload
@@ -2862,6 +2912,20 @@ fn default_visible_frame(result: &FuzzyResult) -> bool {
     }
 }
 
+pub(crate) fn project_query_overlap(query: &str, result: &FuzzyResult) -> usize {
+    let query = normalize_query(query);
+    let query_terms: std::collections::HashSet<_> = query
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|term| term.chars().count() >= 3)
+        .collect();
+    let project = normalize_query(&result.project);
+    let project_terms: std::collections::HashSet<_> = project
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|term| term.chars().count() >= 3)
+        .collect();
+    query_terms.intersection(&project_terms).count()
+}
+
 fn semantic_quality_score(query: &str, result: &FuzzyResult) -> u8 {
     let lexical = result.label.starts_with("lexical_tantivy");
     // Reserve half the working range for evidence in the matched context.
@@ -2880,6 +2944,7 @@ fn semantic_quality_score(query: &str, result: &FuzzyResult) -> u8 {
         Some(FrameKind::InternalThought | FrameKind::ToolCall | FrameKind::SystemNote) => -20,
     };
 
+    score += (project_query_overlap(query, result) * 16).min(32) as i16;
     let normalized_query = normalize_query(query);
     let query_terms: Vec<&str> = normalized_query
         .split_whitespace()
@@ -5479,5 +5544,26 @@ mod tests {
         assert!(line.contains("dense_count=123"));
         assert!(line.contains("dense_kind=exact_mmap_v1"));
         assert!(line.contains("lexical_doc_count=122"));
+    }
+
+    #[test]
+    fn lexical_winner_joins_hybrid_candidates_before_reranking() {
+        let mut lexical = fuzzy(95, "conversations", "2026-11-25", None);
+        lexical.path = "lexical-winner".into();
+        lexical.project = "loctree/aicx".into();
+        lexical.session_id = Some("lexical-winner".into());
+        lexical.matched_lines = vec!["The complete matching answer".into()];
+        let mut hybrid: Vec<_> = (0..12)
+            .map(|n| {
+                let mut hit = fuzzy(60, "conversations", "2026-11-20", None);
+                hit.path = format!("hybrid-{n}");
+                hit.session_id = Some(format!("hybrid-{n}"));
+                hit
+            })
+            .collect();
+        merge_lexical_candidates(std::slice::from_ref(&lexical), &mut hybrid);
+        assert_eq!(hybrid[0].session_id.as_deref(), Some("lexical-winner"));
+        assert_eq!(hybrid[0].matched_lines, lexical.matched_lines);
+        assert_eq!(hybrid.len(), 12);
     }
 }

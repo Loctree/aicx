@@ -470,6 +470,17 @@ impl HybridIndex {
         })
     }
 
+    /// Enrich a fused session with the lexical evidence that matched the query.
+    /// Legacy dense generations carry only a session preview; the lexical
+    /// payload remains the source of the displayed answer.
+    pub fn query_snippets(
+        &self,
+        query: &str,
+        chunk_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        self.lexical.query_snippets(query, chunk_ids)
+    }
+
     pub fn manifest(&self) -> Option<&Manifest> {
         self.manifest.as_ref()
     }

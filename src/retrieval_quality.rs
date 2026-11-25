@@ -8,9 +8,10 @@ mod rerank;
 
 pub use config::QualityConfig;
 
-use std::{path::Path, time::Instant};
+use std::time::Instant;
 
 use aicx_retrieve::{RequestedMode, RetrievalEvidence, RetrievalOutcome};
+use anyhow::{Result, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -23,20 +24,16 @@ use config::Setting;
 
 const QUERY_BYTES: usize = 4096;
 
-fn bounded(text: &str, bytes: usize) -> &str {
-    let mut end = text.len().min(bytes);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
+fn checked_query(text: &str) -> Result<&str> {
+    ensure!(
+        text.len() <= QUERY_BYTES,
+        "query exceeds the model input budget"
+    );
+    Ok(text)
 }
 
-fn document(hit: &FuzzyResult, bytes: usize) -> String {
-    let filename = Path::new(&hit.file)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    let mut text = String::with_capacity(bytes);
+fn document(hit: &FuzzyResult, bytes: usize) -> Result<String> {
+    let filename = hit.file.rsplit(['/', '\\']).next().unwrap_or("");
     let metadata = [
         hit.project.as_str(),
         hit.kind.as_str(),
@@ -45,17 +42,17 @@ fn document(hit: &FuzzyResult, bytes: usize) -> String {
         hit.label.as_str(),
     ];
     let lines = hit.matched_lines.iter().map(String::as_str).chain(metadata);
-    for line in lines.filter(|line| !line.is_empty()) {
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        let part = bounded(line, bytes - text.len());
-        text.push_str(part);
-        if part.len() < line.len() || text.len() == bytes {
-            break;
-        }
-    }
-    text
+    let text = lines
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Passage selection belongs to retrieval. Silently cutting the selected
+    // evidence at a byte limit changes the answer shown to the model.
+    ensure!(
+        text.len() <= bytes,
+        "focused evidence exceeds the per-document model budget"
+    );
+    Ok(text)
 }
 
 #[derive(Serialize)]
@@ -383,6 +380,20 @@ impl SearchTelemetry {
     ) -> Vec<FuzzyResult> {
         if self.reranked() && matches!(sort, None | Some("score")) {
             hits.retain(|hit| kind.is_none_or(|k| hit.kind == k));
+            if let Some(query) = self.quality.as_ref().map(|q| q.original_query.as_str()) {
+                // Exact project intent outranks a cross-encoder's preference
+                // for generic discussion. The stable sort preserves the
+                // model's order among results from the same project.
+                hits.sort_by(|a, b| {
+                    crate::search_engine::project_query_overlap(query, b)
+                        .cmp(&crate::search_engine::project_query_overlap(query, a))
+                        .then_with(|| {
+                            crate::search_engine::lexical_result_evidence_class(query, b).cmp(
+                                &crate::search_engine::lexical_result_evidence_class(query, a),
+                            )
+                        })
+                });
+            }
             hits.truncate(limit);
             hits
         } else {
@@ -416,5 +427,66 @@ impl SearchTelemetry {
             .items
             .sort_by_key(|item| order.get(&item.path).copied().unwrap_or(usize::MAX));
         report
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result_with_text(text: &str) -> FuzzyResult {
+        FuzzyResult {
+            file: "/tmp/evidence.md".into(),
+            path: "/tmp/evidence.md".into(),
+            project: "loctree/aicx".into(),
+            kind: "conversations".into(),
+            frame_kind: Some("conversation".into()),
+            agent: "codex".into(),
+            date: "2026-11-25".into(),
+            timestamp: None,
+            score: 50,
+            label: "hybrid_rrf:fixture".into(),
+            density: 0.1,
+            matched_lines: vec![text.into()],
+            session_id: Some("fixture".into()),
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn model_document_preserves_the_complete_focused_evidence() {
+        let text = "Zażółć gęślą jaźń. The complete answer survives model input.".repeat(20);
+        let document = document(&result_with_text(&text), 4096).unwrap();
+        assert!(document.contains(&text));
+        assert!(!document.ends_with('…'));
+    }
+
+    #[test]
+    fn oversized_model_document_is_rejected_instead_of_silently_truncated() {
+        let error = document(&result_with_text(&"complete evidence".repeat(100)), 64).unwrap_err();
+        assert!(error.to_string().contains("focused evidence"));
+    }
+
+    #[test]
+    fn exact_project_intent_survives_cross_encoder_ordering() {
+        let query = "loctree aicx semantyczna mapa kodu";
+        let mut expected = result_with_text("The map implementation is in loctree/aicx");
+        expected.project = "loctree/aicx".into();
+        let mut generic = result_with_text("A generic Loctree discussion");
+        generic.project = "vetcoders/vc-frame".into();
+        let config = QualityConfig {
+            reranker: Setting::Disabled,
+            decision: Setting::Disabled,
+            rerank_requested: false,
+            decision_requested: false,
+        };
+        let mut report = QualityReport::new(&config, query);
+        report.rerank.status = "applied";
+        let telemetry = SearchTelemetry {
+            quality: Some(report),
+            dense_failure: None,
+        };
+        let hits = telemetry.finalize(vec![generic, expected], None, None, 2);
+        assert_eq!(hits[0].project, "loctree/aicx");
     }
 }
