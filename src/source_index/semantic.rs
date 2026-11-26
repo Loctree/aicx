@@ -6,7 +6,7 @@
 )]
 
 use super::*;
-use std::io::{BufRead, Seek, Write};
+use std::io::{BufRead, BufWriter, Seek, SeekFrom, Write};
 
 pub const SOURCE_DENSE_CHECKPOINT_SCHEMA: &str = "aicx.source_dense_checkpoint.v2";
 pub const SOURCE_DENSE_CHECKPOINT_DIR: &str = "dense-checkpoints";
@@ -63,10 +63,10 @@ fn cache_header(
 }
 
 impl SourceDenseCheckpointRow {
-    fn new(chunk: &aicx_retrieve::ChunkRef, embedding: Vec<f32>) -> Self {
+    fn new(passage: &SemanticPassage<'_>, embedding: Vec<f32>) -> Self {
         let mut row = Self {
-            chunk_id: chunk.id.clone(),
-            content_hash_blake3: source_chunk_content_hash(chunk),
+            chunk_id: passage.id.clone(),
+            content_hash_blake3: passage.content_hash.clone(),
             embedding,
             checksum_blake3: String::new(),
         };
@@ -92,16 +92,21 @@ impl SourceDenseCheckpointRow {
     }
 }
 
+struct CheckpointLocation {
+    offset: u64,
+    content_hash: String,
+}
+
 fn load_cache(
     path: &Path,
     header: &SourceDenseCheckpointHeader,
-) -> Result<HashMap<String, SourceDenseCheckpointRow>> {
+) -> Result<HashMap<String, CheckpointLocation>> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
-    let mut reader = BufReader::new(fs::File::open(path)?);
+    let mut reader = BufReader::with_capacity(128 * 1024, fs::File::open(path)?);
     let mut line = String::new();
-    reader.read_line(&mut line)?;
+    let mut offset = reader.read_line(&mut line)? as u64;
     let observed: SourceDenseCheckpointHeader = serde_json::from_str(&line).with_context(|| {
         format!(
             "invalid semantic cache header: {}; cache retained",
@@ -112,11 +117,11 @@ fn load_cache(
         &observed == header,
         "semantic cache identity mismatch; cache retained"
     );
-    let mut offset = reader.stream_position()?;
     let mut rows = HashMap::new();
     loop {
         line.clear();
-        if reader.read_line(&mut line)? == 0 {
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
             break;
         }
         if !line.ends_with('\n') {
@@ -131,45 +136,106 @@ fn load_cache(
         if let Ok(row) = serde_json::from_str::<SourceDenseCheckpointRow>(&line)
             && row.valid(header.dimension)
         {
-            rows.insert(row.chunk_id.clone(), row);
+            rows.insert(
+                row.chunk_id,
+                CheckpointLocation {
+                    offset,
+                    content_hash: row.content_hash_blake3,
+                },
+            );
         }
-        offset = reader.stream_position()?;
+        offset += bytes as u64;
     }
     Ok(rows)
 }
 
-fn append_rows(path: &Path, rows: &[SourceDenseCheckpointRow]) -> Result<()> {
-    let mut file = fs::OpenOptions::new().append(true).open(path)?;
+fn append_rows(path: &Path, rows: &[SourceDenseCheckpointRow]) -> Result<Vec<u64>> {
+    let file = fs::OpenOptions::new().append(true).open(path)?;
+    let mut position = file.metadata()?.len();
+    let mut writer = BufWriter::with_capacity(128 * 1024, file);
+    let mut line = Vec::new();
+    let mut offsets = Vec::with_capacity(rows.len());
     for row in rows {
-        serde_json::to_writer(&mut file, row)?;
-        file.write_all(b"\n")?;
+        line.clear();
+        serde_json::to_writer(&mut line, row)?;
+        line.push(b'\n');
+        writer.write_all(&line)?;
+        offsets.push(position);
+        position += line.len() as u64;
     }
-    file.flush()?;
-    file.sync_all()?;
-    Ok(())
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    Ok(offsets)
 }
 
 pub(super) struct SemanticPayload {
-    pub chunks: Vec<aicx_retrieve::DenseChunkRef>,
     pub fingerprint: aicx_retrieve::EmbedderFingerprint,
     pub contract: String,
     pub reused: usize,
     pub embedded: usize,
     path: PathBuf,
     header: SourceDenseCheckpointHeader,
+    locations: HashMap<String, CheckpointLocation>,
+    input_byte_budget: usize,
     _lock: crate::locks::LockHandle,
 }
 
 impl SemanticPayload {
+    fn checkpoint_rows<'a>(
+        &'a self,
+        parents: &'a [aicx_retrieve::ChunkRef],
+    ) -> Result<
+        impl ExactSizeIterator<Item = Result<(SemanticPassage<'a>, SourceDenseCheckpointRow)>> + 'a,
+    > {
+        let mut reader = BufReader::with_capacity(128 * 1024, fs::File::open(&self.path)?);
+        let mut line = String::new();
+        let mut position = 0;
+        Ok(semantic_passages(parents, self.input_byte_budget)
+            .into_iter()
+            .map(move |passage| {
+                let location = self
+                    .locations
+                    .get(&passage.id)
+                    .context("dense passage is missing from checkpoint")?;
+                if position != location.offset {
+                    reader.seek(SeekFrom::Start(location.offset))?;
+                    position = location.offset;
+                }
+                line.clear();
+                position += reader.read_line(&mut line)? as u64;
+                let row: SourceDenseCheckpointRow = serde_json::from_str(&line)?;
+                anyhow::ensure!(
+                    line.ends_with('\n')
+                        && row.chunk_id == passage.id
+                        && row.content_hash_blake3 == passage.content_hash
+                        && row.valid(self.header.dimension),
+                    "dense passage checkpoint changed before publication"
+                );
+                Ok((passage, row))
+            }))
+    }
+
+    pub(super) fn dense_rows<'a>(
+        &'a self,
+        parents: &'a [aicx_retrieve::ChunkRef],
+    ) -> Result<impl ExactSizeIterator<Item = Result<aicx_retrieve::DenseChunkRef>> + 'a> {
+        Ok(self.checkpoint_rows(parents)?.map(|row| {
+            let (passage, row) = row?;
+            Ok(aicx_retrieve::DenseChunkRef {
+                chunk: passage.into_chunk(),
+                embedding: row.embedding,
+            })
+        }))
+    }
+
     /// Prune deleted/changed inputs only after the current source/privacy
     /// snapshot was checked. It is safe to retain this work if publication fails.
-    pub fn compact(&self) -> Result<()> {
+    pub fn compact(&self, parents: &[aicx_retrieve::ChunkRef]) -> Result<()> {
         write_snapshot(
             &self.path,
             &self.header,
-            self.chunks
-                .iter()
-                .map(|d| SourceDenseCheckpointRow::new(&d.chunk, d.embedding.clone())),
+            self.checkpoint_rows(parents)?
+                .map(|row| row.map(|(_, value)| value)),
         )
     }
 }
@@ -177,22 +243,24 @@ impl SemanticPayload {
 fn write_snapshot(
     path: &Path,
     header: &SourceDenseCheckpointHeader,
-    rows: impl IntoIterator<Item = SourceDenseCheckpointRow>,
+    rows: impl IntoIterator<Item = Result<SourceDenseCheckpointRow>>,
 ) -> Result<()> {
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     let result: Result<()> = (|| {
-        let mut file = fs::OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&tmp)?;
-        serde_json::to_writer(&mut file, header)?;
-        file.write_all(b"\n")?;
+        let mut writer = BufWriter::with_capacity(128 * 1024, file);
+        serde_json::to_writer(&mut writer, header)?;
+        writer.write_all(b"\n")?;
         for row in rows {
-            serde_json::to_writer(&mut file, &row)?;
-            file.write_all(b"\n")?;
+            serde_json::to_writer(&mut writer, &row?)?;
+            writer.write_all(b"\n")?;
         }
-        file.sync_all()?;
-        drop(file);
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        drop(writer);
         fs::rename(&tmp, path)?;
         #[cfg(unix)]
         fs::File::open(path.parent().expect("cache parent"))?.sync_all()?;
@@ -206,28 +274,59 @@ fn write_snapshot(
 
 /// Partition every admitted byte, on message and whitespace boundaries. Byte
 /// offsets remain exact UTF-8 boundaries, including for a long unbroken line.
-pub(super) fn semantic_passages(
+struct SemanticPassage<'a> {
+    parent: &'a aicx_retrieve::ChunkRef,
+    id: String,
+    content_hash: String,
+    text: &'a str,
+    start_line: usize,
+    end_line: usize,
+}
+
+impl SemanticPassage<'_> {
+    fn into_chunk(self) -> aicx_retrieve::ChunkRef {
+        let mut metadata = serde_json::Map::new();
+        if let Some(parent) = self.parent.metadata.as_object() {
+            for (key, value) in parent {
+                let value = if key == "preview_lines" {
+                    let lines: Vec<String> = value
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(serde_json::Value::as_str)
+                        .take(6)
+                        .map(|line| line.chars().take(240).collect())
+                        .collect();
+                    serde_json::json!(lines)
+                } else {
+                    value.clone()
+                };
+                metadata.insert(key.clone(), value);
+            }
+        }
+        metadata.insert("parent_chunk_id".into(), self.parent.id.clone().into());
+        metadata.insert(
+            "semantic_passage_lines".into(),
+            serde_json::json!([self.text]),
+        );
+        metadata.insert("passage_start_line".into(), self.start_line.into());
+        metadata.insert("passage_end_line".into(), self.end_line.into());
+        aicx_retrieve::ChunkRef {
+            id: self.id,
+            source_path: self.parent.source_path.clone(),
+            text: self.text.to_string(),
+            metadata: metadata.into(),
+        }
+    }
+}
+
+fn semantic_passages(
     chunks: &[aicx_retrieve::ChunkRef],
     budget: usize,
-) -> Vec<aicx_retrieve::ChunkRef> {
+) -> Vec<SemanticPassage<'_>> {
     let budget = budget.max(4);
     let mut out = Vec::new();
     for parent in chunks {
-        // Older parse caches kept whole preview lines. Normalize once per
-        // parent before cloning metadata, including already admitted lexical
-        // documents reused without reparsing. Passage text remains complete.
-        let mut metadata = parent.metadata.clone();
-        if let Some(preview) = metadata.get_mut("preview_lines") {
-            let lines: Vec<String> = preview
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(serde_json::Value::as_str)
-                .take(6)
-                .map(|line| line.chars().take(240).collect())
-                .collect();
-            *preview = serde_json::json!(lines);
-        }
         let text = parent.text.as_str();
         // The extract preamble is provenance, not conversational evidence.
         let start = if text.starts_with("# AICX session extract\n") {
@@ -266,18 +365,15 @@ pub(super) fn semantic_passages(
                 if !passage.trim().is_empty() {
                     let hash = blake3::hash(passage.as_bytes()).to_hex().to_string();
                     let ordinal = seen.entry(hash.clone()).or_default();
-                    let mut chunk = aicx_retrieve::ChunkRef {
+                    out.push(SemanticPassage {
+                        parent,
                         id: format!("{}:passage:{hash}:{}", parent.id, *ordinal),
-                        source_path: parent.source_path.clone(),
-                        text: passage.to_string(),
-                        metadata: metadata.clone(),
-                    };
+                        content_hash: hash,
+                        text: passage,
+                        start_line,
+                        end_line: next_line,
+                    });
                     *ordinal += 1;
-                    chunk.metadata["parent_chunk_id"] = parent.id.clone().into();
-                    chunk.metadata["semantic_passage_lines"] = serde_json::json!([passage]);
-                    chunk.metadata["passage_start_line"] = start_line.into();
-                    chunk.metadata["passage_end_line"] = next_line.into();
-                    out.push(chunk);
                 }
                 lo = hi;
             }
@@ -357,7 +453,7 @@ pub(super) fn embed_chunks_for_semantic(
         parallelism: 1,
         started_at: chrono::Utc::now(),
     });
-    let indexed = |index, chunk: &aicx_retrieve::ChunkRef, duration_ms| {
+    let indexed = |index, chunk: &SemanticPassage<'_>, duration_ms| {
         progress.on_event(&IndexEvent::ItemStarted {
             item_index: index,
             label: chunk.id.clone(),
@@ -370,7 +466,7 @@ pub(super) fn embed_chunks_for_semantic(
             duration_ms,
             embedder_ms: None,
             tokens_estimated: None,
-            content_hash: Some(source_chunk_content_hash(chunk)),
+            content_hash: Some(chunk.content_hash.clone()),
         });
     };
     let result: Result<_> = (|| {
@@ -379,76 +475,74 @@ pub(super) fn embed_chunks_for_semantic(
         fs::create_dir_all(path.parent().expect("cache parent"))?;
         let lock = crate::locks::acquire_exclusive(root.join("semantic-cache.lock"))?;
         let header = cache_header(&contract, &fingerprint);
-        let mut cache = load_cache(&path, &header)?;
+        let mut locations = load_cache(&path, &header)?;
         if !path.exists() {
             write_snapshot(&path, &header, [])?;
         }
-        let mut ready = HashMap::new();
+        let mut reused = 0;
+        let mut missing = Vec::new();
         for (index, chunk) in chunks.iter().enumerate() {
-            if let Some(row) = cache.remove(&chunk.id)
-                && row.content_hash_blake3 == source_chunk_content_hash(chunk)
+            if locations
+                .get(&chunk.id)
+                .is_some_and(|row| row.content_hash == chunk.content_hash)
             {
-                ready.insert(chunk.id.clone(), row.embedding);
+                reused += 1;
                 indexed(index, chunk, 0);
+            } else {
+                missing.push((index, chunk));
             }
         }
-        let reused = ready.len();
         if reused > 0 {
             phase.tick(reused as u64);
         }
-        let missing: Vec<_> = chunks
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| !ready.contains_key(&c.id))
-            .collect();
         let mut embedded = 0;
+        let embedding_start = Instant::now();
         for batch in missing.chunks(engine.embed_batch_size()) {
             let at = Instant::now();
-            let texts: Vec<_> = batch.iter().map(|(_, c)| c.text.as_str()).collect();
+            let texts: Vec<_> = batch.iter().map(|(_, c)| c.text).collect();
             let vectors = engine.embed_batch(&texts)?;
+            anyhow::ensure!(
+                vectors.len() == batch.len(),
+                "embedder returned the wrong number of vectors"
+            );
             let rows: Vec<_> = batch
                 .iter()
                 .zip(vectors)
                 .map(|((_, c), v)| SourceDenseCheckpointRow::new(c, v))
                 .collect();
             // fsync before progress claims the batch can be resumed.
-            append_rows(&path, &rows)?;
+            let offsets = append_rows(&path, &rows)?;
             for (index, chunk) in batch {
                 indexed(*index, chunk, at.elapsed().as_millis() as u64);
             }
-            for row in rows {
-                ready.insert(row.chunk_id, row.embedding);
+            for (row, offset) in rows.into_iter().zip(offsets) {
+                locations.insert(
+                    row.chunk_id,
+                    CheckpointLocation {
+                        offset,
+                        content_hash: row.content_hash_blake3,
+                    },
+                );
                 embedded += 1;
             }
             phase.tick((reused + embedded) as u64);
-            let snapshot = progress.snapshot();
+            let rate = embedded as f64 / embedding_start.elapsed().as_secs_f64();
+            let eta = chunks.len().saturating_sub(reused + embedded) as f64 / rate;
             eprintln!(
-                "aicx index --semantic · passages {}/{} · reused={reused} embedded={embedded} · {:.2} passages/s · ETA {}",
+                "aicx index --semantic · passages {}/{} · reused={reused} embedded={embedded} · {rate:.2} passages/s · ETA {eta:.0}s",
                 reused + embedded,
                 chunks.len(),
-                snapshot.items_per_sec,
-                snapshot
-                    .eta_secs
-                    .map_or_else(|| "unknown".into(), |s| format!("{s:.0}s"))
             );
         }
-        let dense = chunks
-            .into_iter()
-            .map(|chunk| {
-                let embedding = ready
-                    .remove(&chunk.id)
-                    .expect("every passage durably embedded");
-                aicx_retrieve::DenseChunkRef { chunk, embedding }
-            })
-            .collect();
         Ok(SemanticPayload {
-            chunks: dense,
             fingerprint,
             contract,
             reused,
             embedded,
             path,
             header,
+            locations,
+            input_byte_budget: engine.input_byte_budget(),
             _lock: lock,
         })
     })();
@@ -511,10 +605,10 @@ mod tests {
         let passages = semantic_passages(std::slice::from_ref(&parent), 504);
         assert!(passages.len() > 100);
         assert_eq!(
-            passages.iter().map(|c| c.text.as_str()).collect::<String>(),
+            passages.iter().map(|c| c.text).collect::<String>(),
             parent.text
         );
-        for passage in &passages {
+        for passage in passages.into_iter().map(SemanticPassage::into_chunk) {
             let preview = passage.metadata["preview_lines"].as_array().unwrap();
             assert!(preview.len() <= 6);
             assert!(
@@ -540,12 +634,9 @@ mod tests {
             text: text.clone(),
             metadata: serde_json::json!({}),
         };
-        let chunks = semantic_passages(&[parent], 127);
+        let chunks = semantic_passages(std::slice::from_ref(&parent), 127);
         assert!(chunks.iter().all(|c| c.text.len() <= 127));
-        assert_eq!(
-            chunks.iter().map(|c| c.text.as_str()).collect::<String>(),
-            text
-        );
+        assert_eq!(chunks.iter().map(|c| c.text).collect::<String>(), text);
         assert!(chunks.last().unwrap().text.contains("KONIEC"));
     }
 }

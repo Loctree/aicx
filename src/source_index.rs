@@ -945,7 +945,7 @@ pub fn build_with_mode(
         );
     }
 
-    let mut semantic_payload = if semantic && !dry_run {
+    let semantic_payload = if semantic && !dry_run {
         Some(embed_chunks_for_semantic(
             aicx_home,
             &source_fingerprint,
@@ -1003,16 +1003,6 @@ pub fn build_with_mode(
             // whose identity or bytes may have moved. A later run retries it.
             chunks.retain(|chunk| !deferred.contains(&chunk.id));
             next_state.sessions.retain(|key, _| !deferred.contains(key));
-            if let Some(payload) = semantic_payload.as_mut() {
-                payload.chunks.retain(|dense| {
-                    dense
-                        .chunk
-                        .metadata
-                        .get("parent_chunk_id")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|id| !deferred.contains(id))
-                });
-            }
             anyhow::ensure!(
                 !chunks.is_empty(),
                 "all signal sources changed during indexing; CURRENT retained; retry index"
@@ -1039,16 +1029,6 @@ pub fn build_with_mode(
         for attempt in 0..3 {
             chunks.retain(|chunk| !deferred.contains(&chunk.id));
             next_state.sessions.retain(|key, _| !deferred.contains(key));
-            if let Some(payload) = semantic_payload.as_mut() {
-                payload.chunks.retain(|dense| {
-                    dense
-                        .chunk
-                        .metadata
-                        .get("parent_chunk_id")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|id| !deferred.contains(id))
-                });
-            }
             anyhow::ensure!(
                 !chunks.is_empty(),
                 "all signal sources changed during indexing; CURRENT retained; retry index"
@@ -1112,7 +1092,7 @@ pub fn build_with_mode(
                     .expect("semantic payload prepared");
                 crate::vector_index::publish_source_hybrid_generation_checked(
                     &chunks,
-                    &payload.chunks,
+                    payload.dense_rows(&chunks)?,
                     &published_fingerprint,
                     &payload.fingerprint,
                     Some(&payload.contract),
@@ -1144,7 +1124,7 @@ pub fn build_with_mode(
             // run retains both previous and newly appended embedding work.
             if deferred.is_empty()
                 && let Some(payload) = semantic_payload.as_ref()
-                && let Err(error) = payload.compact()
+                && let Err(error) = payload.compact(&chunks)
             {
                 crate::diagnostics::log_describe(&format!(
                     "source_index_checkpoint_compaction_failed error={error:#}"
@@ -1556,7 +1536,7 @@ fn current_indexed_session_keys() -> Result<HashSet<String>> {
     if !generation.join("manifest.json").is_file() {
         return Ok(HashSet::new());
     }
-    let lexical = aicx_retrieve::TantivyAdapter::new(generation)?;
+    let lexical = aicx_retrieve::TantivyAdapter::open_existing(generation)?;
     Ok(lexical.scan_chunk_ids()?.into_iter().collect())
 }
 

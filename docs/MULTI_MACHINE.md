@@ -103,6 +103,15 @@ pipeline for foreign session dumps.
 
 - Lexical Tantivy CURRENT is model-agnostic: rebuild from sources on the owner.
 - Dense mmap / embeddings are **fail-closed** on dimension and embedder model drift.
+- Query deployment identity is separate from the embedding space. Qwen3
+  Embedding 8B cosine vectors at 4096 dimensions can be queried interchangeably
+  through Ollama (`qwen3-embedding:8b`), MLX and recognized native GGUF
+  quantizations on macOS, Linux or Windows. Moving the endpoint or quantization
+  does not rewrite the manifest, vectors or CURRENT, and does not require
+  reindexing. Different base models, fine-tunes and dimensions remain distinct.
+- Build input/weight receipts and refresh admission remain exact: query
+  compatibility does not silently mix newly embedded documents into an old
+  generation. Artifact integrity and source/privacy checks remain enforced.
 - Do **not** park laptop 0.6b generations beside the owner's `qwen3-embedding:8b`
   (4096-d) as one CURRENT.
 - Practical rule: **one embedder profile per AICX home**. Laptop can keep a

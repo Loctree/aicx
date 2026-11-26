@@ -123,6 +123,19 @@ impl TantivyAdapter {
             Index::create_in_dir(&dir, schema.clone())
                 .with_context(|| format!("create tantivy index {}", dir.display()))?
         };
+        Self::from_index(dir, index)
+    }
+
+    /// Open a committed lexical index without initializing a missing artifact.
+    /// Search readers must use this rather than the writer's create-or-open path.
+    pub fn open_existing(base_dir: PathBuf) -> Result<Self> {
+        let dir = base_dir.join(TANTIVY_INDEX_DIR);
+        let index = Index::open_in_dir(&dir)
+            .with_context(|| format!("open existing tantivy index {}", dir.display()))?;
+        Self::from_index(dir, index)
+    }
+
+    fn from_index(dir: PathBuf, index: Index) -> Result<Self> {
         register_tokenizers(&index);
 
         let schema = index.schema();
@@ -827,6 +840,10 @@ fn is_boilerplate_excerpt(candidate: &str) -> bool {
             "os version:",
             "shell:",
             "workspace path:",
+            "primary input file:",
+            "working directory:",
+            "repo:",
+            "repository:",
             "current_date:",
             "timezone:",
             "run_id:",
@@ -1227,6 +1244,14 @@ impl LexicalIndex for TantivyAdapter {
             hit.rank = rank;
         }
         Ok(hits)
+    }
+
+    fn query_snippets(
+        &self,
+        query: &str,
+        chunk_ids: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        TantivyAdapter::query_snippets(self, query, chunk_ids)
     }
 
     fn commit_id(&self) -> &LexicalCommitId {
@@ -2067,6 +2092,21 @@ mod swap_tests {
         assert_eq!(
             lines,
             vec!["Decision: W2-B-4c must own routing strzałek for the top tabs."]
+        );
+    }
+
+    #[test]
+    fn query_context_ignores_file_and_repository_metadata() {
+        let body = [
+            "Primary input file: /tmp/resume-aicx-loctree-map-code.md",
+            "Repo: /tmp/loctree/aicx",
+            "Decision: loctree/aicx owns the semantic code map contract.",
+        ]
+        .join("\n");
+        let lines = query_context_lines(&body, "loctree aicx semantic map");
+        assert_eq!(
+            lines,
+            vec!["Decision: loctree/aicx owns the semantic code map contract."]
         );
     }
 }

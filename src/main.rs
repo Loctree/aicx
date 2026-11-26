@@ -2096,6 +2096,14 @@ enum Commands {
         #[arg(long)]
         deep: bool,
 
+        /// Rerank published candidates with the configured cross-encoder.
+        #[arg(long, conflicts_with = "session")]
+        rerank: bool,
+
+        /// Assess evidence with the configured decision model.
+        #[arg(long, conflicts_with = "session")]
+        decide: bool,
+
         /// Dialogue view of hits: delayed human speech (echo-bus / queue)
         /// rendered as speech, with its seals.
         #[arg(long)]
@@ -3504,6 +3512,8 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             json,
             legacy_dense,
             deep,
+            rerank,
+            decide,
             dialog,
             result,
             lineage,
@@ -3539,6 +3549,8 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 no_semantic,
                 evidence,
                 deep,
+                rerank,
+                decide,
                 project_match,
                 projection,
             })?;
@@ -9946,6 +9958,8 @@ struct SearchRunArgs<'a> {
     no_semantic: bool,
     evidence: bool,
     deep: bool,
+    rerank: bool,
+    decide: bool,
     project_match: legacy_archive::ProjectMatchMode,
     /// Output projection for hit rendering (W2-T13). Retrieval flags stay
     /// retrieval; this only decides how an admitted hit looks.
@@ -10147,10 +10161,17 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         no_semantic,
         evidence,
         deep,
+        rerank,
+        decide,
         project_match,
         projection,
     } = args;
     if let Some(session) = session {
+        if rerank || decide {
+            anyhow::bail!(
+                "--session searches passages directly; --rerank and --decide require indexed search"
+            );
+        }
         let root = aicx::aicx_home::resolve()?;
         return run_session_passage_search(&root, session, query, context, literal, json);
     }
@@ -10224,87 +10245,117 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         index_filters.deep = false;
         index_filters.legacy_dense = false;
     }
-    let (results, scanned, semantic_status, pushdown_diagnostic, semantic_fallback) =
-        match aicx::search_engine::try_semantic_search_filtered(
-            &root,
-            &search_query,
-            limit,
-            &scopes,
-            filters.frame_kind.map(Into::into),
-            if distill_kind {
-                Some("distill:decision")
-            } else {
-                kind_filter.map(|kind| kind.dir_name())
-            },
-            &index_filters,
-        ) {
-            Ok(filtered) => {
-                let aicx::search_engine::FilteredSemanticOutcome {
-                    outcome,
-                    diagnostic,
-                } = filtered;
-                let status = (
-                    outcome.backend_label,
-                    outcome.model_id.clone(),
-                    outcome.scanned,
-                    outcome.retrieval_status.clone(),
-                );
-                (
-                    outcome.results,
-                    outcome.scanned,
-                    Some(status),
-                    diagnostic,
-                    None,
-                )
-            }
-            Err(err) => {
-                if no_semantic {
-                    eprintln!("{}", coverage.render_line());
-                    anyhow::bail!(
-                        "aicx search --no-semantic requires the published CURRENT lexical index: \
-                         {} ({})\n  recommendation: {}",
-                        err.kind(),
-                        err.reason(),
-                        err.recommendation()
-                    );
-                }
-                // Filesystem-fuzzy ONLY when no hybrid index exists.
-                // Corrupt / stale / busy / embedder / empty → honest error.
-                if !err.allows_filesystem_fallback() {
-                    if !json {
-                        eprintln!("aicx search: hybrid retrieval failed (no fuzzy swallow).");
-                        eprintln!("  kind:           {}", err.kind());
-                        eprintln!("  reason:         {}", err.reason());
-                        eprintln!("  recommendation: {}", err.recommendation());
+    let quality = aicx::retrieval_quality::QualityConfig::load(
+        &root,
+        rerank.then_some(true),
+        decide.then_some(true),
+    );
+    let mut telemetry = aicx::retrieval_quality::SearchTelemetry::new(&quality, &search_query);
+    let request = aicx::search_engine::PublishedSearch {
+        home: root.clone(),
+        projects: scopes.iter().map(|p| p.map(str::to_owned)).collect(),
+        limit,
+        frame: filters.frame_kind.map(Into::into),
+        kind: if distill_kind {
+            Some("distill:decision")
+        } else {
+            kind_filter.map(|k| k.dir_name())
+        },
+        filters: index_filters,
+        embedder_cached_unavailable: false,
+    };
+    let (results, scanned, semantic_status, pushdown_diagnostic, semantic_fallback) = match request
+        .retrieve(&search_query)
+    {
+        Ok(mut pass) => {
+            telemetry.record_base(&pass);
+            if quality.active() {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => {
+                        runtime.block_on(telemetry.apply(
+                            &quality,
+                            &search_query,
+                            &request,
+                            &mut pass,
+                        ));
                     }
-                    eprintln!("{}", coverage.render_line());
-                    anyhow::bail!(
-                        "aicx search failed: {} ({})\n  recommendation: {}",
-                        err.kind(),
-                        err.reason(),
-                        err.recommendation()
-                    );
+                    Err(_) => telemetry.skip("could not initialize optional HTTP runtime"),
                 }
-                let fallback = SemanticFallbackNotice::from_error(&err);
-                let (results, scanned) = aicx::search_engine::fuzzy_search_with_post_filters(
-                    &root,
-                    &search_query,
-                    limit,
-                    &scopes,
-                    filters.frame_kind.map(Into::into),
-                    &post_filters,
-                )?;
+            }
+            let aicx::search_engine::FilteredSemanticOutcome {
+                outcome,
+                diagnostic,
+            } = pass.filtered;
+            let status = (
+                outcome.backend_label,
+                outcome.model_id.clone(),
+                outcome.scanned,
+                outcome.retrieval_status.clone(),
+            );
+            (
+                outcome.results,
+                outcome.scanned,
+                Some(status),
+                diagnostic,
+                None,
+            )
+        }
+        Err(err) => {
+            if no_semantic {
+                eprintln!("{}", coverage.render_line());
+                anyhow::bail!(
+                    "aicx search --no-semantic requires the published CURRENT lexical index: \
+                         {} ({})\n  recommendation: {}",
+                    err.kind(),
+                    err.reason(),
+                    err.recommendation()
+                );
+            }
+            // Filesystem-fuzzy ONLY when no hybrid index exists.
+            // Corrupt / stale / busy / embedder / empty → honest error.
+            if !err.allows_filesystem_fallback() {
                 if !json {
-                    eprintln!(
-                        "aicx search: index not built; falling back to filesystem fuzzy (recency-ranked)."
-                    );
+                    eprintln!("aicx search: hybrid retrieval failed (no fuzzy swallow).");
                     eprintln!("  kind:           {}", err.kind());
                     eprintln!("  reason:         {}", err.reason());
                     eprintln!("  recommendation: {}", err.recommendation());
                 }
-                (results, scanned, None, None, Some(fallback))
+                eprintln!("{}", coverage.render_line());
+                anyhow::bail!(
+                    "aicx search failed: {} ({})\n  recommendation: {}",
+                    err.kind(),
+                    err.reason(),
+                    err.recommendation()
+                );
             }
-        };
+            telemetry.skip("published index unavailable; serving the filesystem fallback");
+            let fallback = SemanticFallbackNotice::from_error(&err);
+            let (results, scanned) = aicx::search_engine::fuzzy_search_with_post_filters(
+                &root,
+                &search_query,
+                limit,
+                &scopes,
+                filters.frame_kind.map(Into::into),
+                &post_filters,
+            )?;
+            if !json {
+                eprintln!(
+                    "aicx search: index not built; falling back to filesystem fuzzy (recency-ranked)."
+                );
+                eprintln!("  kind:           {}", err.kind());
+                eprintln!("  reason:         {}", err.reason());
+                eprintln!("  recommendation: {}", err.recommendation());
+            }
+            (results, scanned, None, None, Some(fallback))
+        }
+    };
+
+    if !json {
+        telemetry.print_summary();
+    }
 
     // Defensive kind retain ahead of the evidence path: the shared finalize
     // below retains too, but `--evidence` consumes `results` before finalize
@@ -10315,7 +10366,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     }
 
     if evidence {
-        let report = aicx::evidence::build_evidence_report(&search_query, results, limit);
+        let report = telemetry.evidence(&search_query, results, limit);
         let source_paths_verified = aicx::oracle::verify_paths(
             aicx::evidence::evidence_source_paths(&report).map(Path::to_path_buf),
         );
@@ -10341,6 +10392,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                     !source_paths_verified,
                 ),
             };
+            let base = telemetry.retrieval(base);
             if pushdown_diagnostic.is_some() {
                 base.mark_partial()
             } else {
@@ -10383,7 +10435,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
             }
             payload = inject_search_coverage(&payload, &coverage)?;
             eprintln!("{}", coverage.render_line());
-            println!("{}", payload);
+            println!("{}", telemetry.attach(payload)?);
             return Ok(());
         }
 
@@ -10446,7 +10498,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         SortOrder::Oldest => "oldest",
         SortOrder::Score => "score",
     });
-    let results = aicx::search_engine::finalize_fuzzy_results(
+    let results = telemetry.finalize(
         results,
         kind_filter.map(|kind| kind.dir_name()),
         sort_label,
@@ -10486,6 +10538,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                 !source_paths_verified,
             ),
         };
+        let base = telemetry.retrieval(base);
         if pushdown_diagnostic.is_some() {
             base.mark_partial()
         } else {
@@ -10529,7 +10582,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         }
         payload = inject_search_coverage(&payload, &coverage)?;
         eprintln!("{}", coverage.render_line());
-        println!("{}", payload);
+        println!("{}", telemetry.attach(payload)?);
         return Ok(());
     }
 

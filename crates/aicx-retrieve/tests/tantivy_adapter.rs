@@ -57,6 +57,35 @@ fn build_and_query_smoke() {
 }
 
 #[test]
+fn existing_reader_never_initializes_a_missing_generation() {
+    let temp = TempDir::new().unwrap();
+    let missing = temp.path().join("missing");
+    assert!(TantivyAdapter::open_existing(missing.clone()).is_err());
+    assert!(!missing.exists(), "a reader created a missing generation");
+
+    let mut writer = TantivyAdapter::new(temp.path().to_path_buf()).unwrap();
+    writer
+        .build(&[chunk(0, "quartz durable evidence", "codex")])
+        .unwrap();
+    let expected_commit = writer.commit_id().clone();
+    drop(writer);
+    let reader = TantivyAdapter::open_existing(temp.path().to_path_buf()).unwrap();
+    assert_eq!(reader.commit_id(), &expected_commit);
+    assert_eq!(reader.query(&query("quartz", 2)).unwrap().len(), 1);
+    drop(reader);
+
+    fs::remove_file(temp.path().join(TANTIVY_INDEX_DIR).join("meta.json")).unwrap();
+    assert!(TantivyAdapter::open_existing(temp.path().to_path_buf()).is_err());
+    assert!(
+        !temp
+            .path()
+            .join(TANTIVY_INDEX_DIR)
+            .join("meta.json")
+            .exists()
+    );
+}
+
+#[test]
 fn filter_pre_pass_limits_hits_to_agent() {
     let temp = TempDir::new().unwrap();
     let mut adapter = TantivyAdapter::new(temp.path().to_path_buf()).unwrap();

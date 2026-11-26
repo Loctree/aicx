@@ -130,6 +130,29 @@ timeout_secs = 30
 # Optional extra headers (rarely needed; uncomment to use):
 # [embedder.cloud.headers]
 # "X-Trace-Id" = "vetcoders-aicx"
+
+# Optional search stages. A configured endpoint is used when the previous
+# stage completes. Set enabled = false to opt out of the default for a stage.
+# With no reranker section, hybrid search discovers a local reranker on 12346.
+# [retrieval.reranker]
+# url = "http://127.0.0.1:12346/v1/rerank"
+# model = "galaxycore/Qwen3-Reranker-8B-MLX-4bit"
+# timeout_secs = 15
+# max_candidates = 12
+# max_doc_bytes = 4096
+# api_key_env = "AICX_RERANK_API_KEY"
+#
+# [retrieval.decision]
+# For Intern-Decision use protocol = "systemone" and the /v1/systemone URL.
+# protocol = "responses"
+# url = "http://127.0.0.1:8100/v1/responses"
+# model = "PocketAiHub/Qwen3.8-27B-Abliterated-MTPLX-Optimized-Speed"
+# timeout_secs = 30
+# max_candidates = 12
+# max_doc_bytes = 2048
+# max_output_tokens = 512
+# max_refinements = 1
+# api_key_env = "AICX_DECISION_API_KEY"
 "#;
 
 fn canonical_config_path() -> Result<PathBuf> {
@@ -244,6 +267,7 @@ struct RuntimeInspection {
     installations: InstallationInspection,
     mcp: McpInspection,
     embedder: EmbedderInspection,
+    retrieval: serde_json::Value,
     index: IndexGenerationInspection,
     actions: Vec<String>,
 }
@@ -262,11 +286,16 @@ fn run_runtime_inspection(json: bool, mcp_configs: &[PathBuf]) -> Result<()> {
             "  generation: {}",
             inspection.index.generation.as_deref().unwrap_or("<none>")
         );
+        eprintln!("  retrieval:  {}", inspection.retrieval);
         for action in inspection.actions {
             eprintln!("  action: {action}");
         }
     }
     Ok(())
+}
+
+fn retrieval_inspection(home: &Path) -> serde_json::Value {
+    aicx::retrieval_quality::QualityConfig::load(home, None, None).inspection()
 }
 
 fn inspect_runtime(mcp_configs: &[PathBuf]) -> Result<RuntimeInspection> {
@@ -335,6 +364,7 @@ fn inspect_runtime(mcp_configs: &[PathBuf]) -> Result<RuntimeInspection> {
             path: home.display().to_string(),
             source: home_source,
         },
+        retrieval: retrieval_inspection(&home),
         config: effective,
         installations: InstallationInspection {
             aicx: aicx_candidates,
@@ -926,6 +956,7 @@ fn run_config_show(json: bool) -> Result<()> {
 
     let canonical_path = canonical_config_path().ok();
     let resolved_aicx_home = aicx::aicx_home::resolve().ok();
+    let retrieval = resolved_aicx_home.as_deref().map(retrieval_inspection);
     let effective = aicx::embedder::effective_config_source();
     let (effective_path_display, effective_branch, marker_line) =
         describe_effective_config(&effective);
@@ -969,6 +1000,7 @@ fn run_config_show(json: bool) -> Result<()> {
             "effective_branch": effective_branch,
             "config_path": canonical_path.as_ref().map(|p| p.display().to_string()),
             "cloud_section_present": cloud_set,
+            "retrieval": retrieval,
             "available_cached_profiles": cached_profiles.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
             "suggested_profile": suggested_profile.map(|p| p.as_str()),
         });
@@ -989,6 +1021,9 @@ fn run_config_show(json: bool) -> Result<()> {
     eprintln!("  effective_config_path: {effective_path_display}");
     eprintln!("  effective_branch:      {effective_branch}");
     eprintln!("  {marker_line}");
+    if let Some(retrieval) = retrieval {
+        eprintln!("  retrieval:   {retrieval}");
+    }
     eprintln!("  backend:     {}", cfg.backend.as_str());
     eprintln!("  profile:     {}", cfg.profile.as_str());
     eprintln!("  native.repo:           {}", resolved.repo);
@@ -1079,7 +1114,16 @@ pub(crate) fn describe_effective_config(
 }
 
 #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
-fn run_config_show(_json: bool) -> Result<()> {
+fn run_config_show(json: bool) -> Result<()> {
+    let retrieval = retrieval_inspection(&aicx::aicx_home::resolve()?);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"retrieval": retrieval}))?
+        );
+        return Ok(());
+    }
+    eprintln!("  retrieval:   {retrieval}");
     eprintln!(
         "aicx was built without any embedder feature. \
          Install a pre-built release (e.g., `npm install -g @loctree/aicx`), \

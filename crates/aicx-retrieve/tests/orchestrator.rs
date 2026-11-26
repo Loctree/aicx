@@ -254,6 +254,136 @@ fn manifest_embedder_drift_fails_fast() {
 }
 
 #[test]
+fn qwen3_8b_provider_migration_queries_existing_vectors_without_rewriting_them() {
+    let dim = 4096;
+    let temp = TempDir::new().unwrap();
+    let (chunks, dense_chunks) = corpus(3, dim);
+    let old_fingerprint =
+        EmbedderFingerprint::new("qwen3-embedding:8b", "http://old-host:11434", dim, "cosine");
+    let mut index = HybridIndex::new(
+        boxed_lexical(temp.path()),
+        boxed_dense(dim),
+        Box::new(ReciprocalRankFusion::default()),
+        temp.path(),
+        old_fingerprint,
+    );
+    index
+        .build_hybrid(&chunks, &dense_chunks, SOURCE_HASH)
+        .unwrap();
+    index.commit().unwrap();
+    persist_dense(temp.path(), dim, &dense_chunks);
+    drop(index);
+    let manifest_path = temp.path().join("manifest.json");
+    let vectors_path = default_ndjson_path(temp.path());
+    let manifest_before = fs::read(&manifest_path).unwrap();
+    let vectors_before = fs::read(&vectors_path).unwrap();
+    let new_fingerprint = EmbedderFingerprint::new(
+        "mlx-community/Qwen3-Embedding-8B-4bit-DWQ",
+        "http://new-host:12345/v1/embeddings",
+        dim,
+        "cosine",
+    );
+    for model in [
+        "mlx-community/Qwen3-Embedding-8B-4bit-DWQ",
+        "/opt/models/Qwen3-Embedding-8B-Q4_K_M.gguf",
+        "Qwen/Qwen3-Embedding-8B-GGUF/Qwen3-Embedding-8B.Q8_0.gguf",
+        r"C:\models\Qwen3-Embedding-8B.BF16.gguf",
+    ] {
+        let loaded = HybridIndex::load_from_manifest(
+            boxed_lexical(temp.path()),
+            loaded_dense(temp.path(), dim),
+            Box::new(ReciprocalRankFusion::default()),
+            temp.path(),
+            EmbedderFingerprint::new(model, "different-deployment", dim, "cosine"),
+            Some(SOURCE_HASH),
+        )
+        .expect("the same Qwen3 8B embedding space must survive provider migration");
+        let hits = loaded
+            .query_hybrid(HybridQueryInput {
+                query_text: "needle",
+                query_embedding: &query_embedding(dim),
+                filters: FilterSet::default(),
+                limit: 3,
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].chunk_id, "chunk-000");
+    }
+    assert_eq!(fs::read(&manifest_path).unwrap(), manifest_before);
+    assert_eq!(fs::read(&vectors_path).unwrap(), vectors_before);
+
+    // Query compatibility does not authorize mixing new vectors into a
+    // generation written with a different model/input contract.
+    let manifest = Manifest::read_from_path(&manifest_path).unwrap();
+    let error = aicx_retrieve::validate_live_bindings_for_refresh(
+        &manifest,
+        boxed_lexical(temp.path()).as_ref(),
+        loaded_dense(temp.path(), dim).as_ref(),
+        &ReciprocalRankFusion::default(),
+        &new_fingerprint,
+    )
+    .expect_err("write admission must keep its exact fingerprint contract");
+    assert!(matches!(error, RetrieveError::EmbedderModelDrift { .. }));
+
+    for model in [
+        "Qwen/Qwen3-Embedding-4B",
+        "custom/Qwen3-Embedding-8B-finetuned",
+    ] {
+        let error = expect_load_err(HybridIndex::load_from_manifest(
+            boxed_lexical(temp.path()),
+            loaded_dense(temp.path(), dim),
+            Box::new(ReciprocalRankFusion::default()),
+            temp.path(),
+            EmbedderFingerprint::new(model, "http://new-host:12345", dim, "cosine"),
+            Some(SOURCE_HASH),
+        ));
+        assert!(matches!(
+            error.downcast_ref::<RetrieveError>(),
+            Some(RetrieveError::EmbedderModelDrift { .. })
+        ));
+    }
+}
+
+#[test]
+fn embedding_space_is_portable_symmetric_and_keeps_model_dimension_and_distance_separate() {
+    let deployments = [
+        "qwen3-embedding:8b",
+        "qwen3-embedding:8b-q4_k_m",
+        "mlx-community/Qwen3-Embedding-8B-4bit-DWQ",
+        "/opt/models/Qwen3-Embedding-8B.Q8_0.gguf",
+    ];
+    for a in deployments {
+        for b in deployments {
+            let a = EmbedderFingerprint::new(a, "host-a", 4096, "cosine");
+            let b = EmbedderFingerprint::new(b, "host-b", 4096, "cosine");
+            assert!(a.shares_embedding_space(&b));
+            assert!(b.shares_embedding_space(&a));
+        }
+    }
+    let base = EmbedderFingerprint::new(deployments[0], "host-a", 4096, "cosine");
+    for model in [
+        "qwen3-embedding:0.6b",
+        "Qwen3-Embedding-8B-finetuned-Q4_K_M.gguf",
+        "Qwen3-Embedding-8B-plus",
+        "other-4096-model",
+    ] {
+        assert!(
+            !base.shares_embedding_space(&EmbedderFingerprint::new(
+                model, "host-b", 4096, "cosine",
+            ))
+        );
+    }
+    for (dim, distance) in [(2048, "cosine"), (4096, "dot")] {
+        assert!(!base.shares_embedding_space(&EmbedderFingerprint::new(
+            deployments[1],
+            "host-b",
+            dim,
+            distance,
+        )));
+    }
+}
+
+#[test]
 fn manifest_source_hash_drift_fails_fast() {
     let dim = 4;
     let (temp, _, _, _) = build_committed_index(12, dim);

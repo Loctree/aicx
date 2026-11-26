@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-23
+
+### Added
+
+- Optional cross-encoder reranking and grounded evidence assessment for CLI and
+  MCP searches. Enable them per query with `--rerank` and `--decide`, or configure
+  the corresponding retrieval stages. Both stages are disabled by default.
+- Configurable Responses and Chat Completions decision endpoints, strict evidence
+  references, and at most one optional refinement under the original filters.
+
+### Fixed
+
+- A healthy published Tantivy index now remains available when the semantic,
+  reranker, or decision layer fails, including explicitly requested stages.
+  Searches return the available results with diagnostics for the failed layer.
+  Query readers never create or rebuild missing published index artifacts.
+- Existing Qwen3 Embedding 8B vectors can be read across recognized Ollama, MLX,
+  and GGUF variants without rebuilding the index. Model family, 4096 dimensions,
+  and cosine distance remain validated; indexing retains strict model identity.
+- MLX reranking requests include `top_k` alongside `top_n`, preserving complete
+  candidate mappings when the server otherwise defaults to ten results.
+
 ## [0.16.1] - 2026-11-20
 
 ### Changed

@@ -644,6 +644,14 @@ pub struct SearchParams {
     #[serde(default)]
     #[schemars(with = "bool")]
     pub deep: Option<bool>,
+    /// Use the configured cross-encoder on the filtered candidate pool.
+    #[serde(default)]
+    #[schemars(with = "bool")]
+    pub rerank: Option<bool>,
+    /// Assess evidence sufficiency and optionally refine the query once.
+    #[serde(default)]
+    #[schemars(with = "bool")]
+    pub decide: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1281,7 +1289,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_search",
-        description = "Search the CURRENT source/extract index. Automatically uses lexical plus semantic passage fusion when CURRENT contains vectors. Set deep=false for lexical search. Filesystem-fuzzy fallback applies only when the hybrid index is missing (IndexNotBuilt), with an explicit `semantic_fallback` payload. Corrupt, stale, busy, empty, dimension-mismatch, and embedder failures return a typed fail-fast error (use strict_semantic=true for the same fail-fast on IndexNotBuilt). Filter pushdown (agent/score/date/hours) iterates a bounded semantic retrieval pool (up to 10x the requested limit) so a corpus whose top-N raw hits all sit outside the filter window still surfaces inside-window matches further down the ranking instead of returning silent-empty. When the cap is examined without satisfying the limit, the response carries a `filter_pushdown` payload with `kind=\"filter_yielded_partial\"` so callers can distinguish bounded under-delivery from a genuinely empty corpus."
+        description = "Search the CURRENT source/extract index. Automatically uses lexical plus semantic passage fusion when CURRENT contains vectors. Set deep=false for lexical search. Filesystem-fuzzy fallback applies only when the hybrid index is missing (IndexNotBuilt), with an explicit `semantic_fallback` payload. A dense or model failure can serve the verified published Tantivy index with a diagnostic. A base validation error fails the request. strict_semantic=true also refuses the filesystem fallback. Filter pushdown (agent/score/date/hours) iterates a bounded semantic retrieval pool (up to 10x the requested limit) so a corpus whose top-N raw hits all sit outside the filter window still surfaces inside-window matches further down the ranking instead of returning silent-empty. When the cap is examined without satisfying the limit, the response carries a `filter_pushdown` payload with `kind=\"filter_yielded_partial\"` so callers can distinguish bounded under-delivery from a genuinely empty corpus."
     )]
     async fn search(
         &self,
@@ -1359,7 +1367,7 @@ impl AicxMcpServer {
 
         let post_filters = filter_build.post_filters;
 
-        // One request value shared by both fuzzy-fallback exits below.
+        // The filesystem fallback is available only for an unpublished index.
         let fallback_request = McpFuzzyFallbackRequest {
             aicx_home: &aicx_home,
             query: &query,
@@ -1371,87 +1379,60 @@ impl AicxMcpServer {
             sort: params.sort.as_deref(),
         };
 
-        // D-6: short-circuit while the embedder is in the negative-cache
-        // window. Embedder failures are NOT IndexNotBuilt — do not degrade to
-        // filesystem fuzzy (audit recovery 2026-07-23). Surface the typed
-        // error so callers rebuild/heal the embedder instead of ranking noise.
-        let now = Instant::now();
-        if post_filters.deep
-            && let Some(remaining) = self.embedder_negative_cache_remaining(now)
-        {
-            let fallback = McpSemanticFallbackNotice {
-                kind: "embedder_unavailable".to_string(),
-                reason: format!(
-                    "embedder negative cache active for another {}s — last embed attempt failed",
-                    remaining.as_secs()
-                ),
-                recommendation: "run `aicx doctor` to inspect embedder health; the cache clears automatically after the TTL elapses".to_string(),
-            };
-            return Err(mcp_semantic_unavailable_error(&fallback));
-        }
-
-        // Semantic-first dispatch with filter pushdown. Filesystem-fuzzy
-        // only for IndexNotBuilt (CLI parity). Other hybrid errors fail
-        // typed. `strict_semantic=true` also fails IndexNotBuilt fast.
-        // The wrapper iterates a bounded retrieval pool
-        // (`FILTER_EXAMINED_CAP_RATIO` x `limit`) so the canonical
-        // pathology — top-N raw hits sit outside the filter window while
-        // valid hits exist below — does not surface as silent-empty.
-        // Retrieval performs blocking disk/model/HTTP work. In particular,
-        // reqwest's blocking cloud client must live outside the async runtime
-        // task, or an opted-in deep call can panic without a protocol response.
-        let search_home = aicx_home.clone();
-        let search_query = query.clone();
-        let search_scopes = project_scopes_owned.clone();
-        let search_filters = post_filters.clone();
-        let retrieval = tokio::task::spawn_blocking(move || {
-            let scopes = search_scopes
-                .iter()
-                .map(|s| s.as_deref())
-                .collect::<Vec<_>>();
-            crate::search_engine::try_semantic_search_filtered(
-                &search_home,
-                &search_query,
-                limit,
-                &scopes,
-                frame_kind,
-                kind_filter_dir,
-                &search_filters,
-            )
-        })
-        .await
-        .map_err(|e| McpError::internal_error(format!("Search worker failed: {e}"), None))?;
-        let filtered = match retrieval {
-            Ok(filtered) => filtered,
+        let quality =
+            crate::retrieval_quality::QualityConfig::load(&aicx_home, params.rerank, params.decide);
+        let mut telemetry = crate::retrieval_quality::SearchTelemetry::new(&quality, &query);
+        let request = crate::search_engine::PublishedSearch {
+            home: aicx_home.clone(),
+            projects: project_scopes_owned.clone(),
+            limit,
+            frame: frame_kind,
+            kind: kind_filter_dir,
+            filters: post_filters.clone(),
+            embedder_cached_unavailable: post_filters.deep
+                && self
+                    .embedder_negative_cache_remaining(Instant::now())
+                    .is_some(),
+        };
+        let first_request = request.clone();
+        let first_query = query.clone();
+        let retrieval = tokio::task::spawn_blocking(move || first_request.retrieve(&first_query))
+            .await
+            .map_err(|_| McpError::internal_error("published search worker failed", None))?;
+        let attach = |info: &crate::retrieval_quality::SearchTelemetry, payload| {
+            info.attach(payload)
+                .map_err(|_| McpError::internal_error("serialize retrieval quality", None))
+        };
+        let mut pass = match retrieval {
+            Ok(pass) => pass,
             Err(err) => {
-                // D-6: arm the negative cache on real embedder failures so
-                // subsequent requests fail-fast for MCP_EMBEDDER_NEGATIVE_TTL
-                // instead of re-running the same broken bootstrap. Other
-                // kinds (index missing, dim mismatch, ...) remain
-                // synchronously retryable.
                 self.note_semantic_failure(&err);
                 let fallback = McpSemanticFallbackNotice::from_error(&err);
-                // Filesystem-fuzzy ONLY for IndexNotBuilt (audit recovery).
-                // strict_semantic remains fail-fast for every kind; non-strict
-                // still must not swallow corrupt/stale/busy into letter-soup.
                 if strict_semantic || !err.allows_filesystem_fallback() {
                     return Err(mcp_semantic_unavailable_error(&fallback));
                 }
+                telemetry.skip("published index unavailable; serving the filesystem fallback");
                 let payload = render_mcp_fuzzy_fallback_payload(&fallback_request, &fallback)?;
-                return Ok(CallToolResult::success(vec![ContentBlock::text(payload)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(attach(
+                    &telemetry, payload,
+                )?)]));
             }
         };
+        if pass.dense_failure == Some("embedder_unavailable") {
+            self.mark_embedder_unavailable(Instant::now(), MCP_EMBEDDER_NEGATIVE_TTL);
+        }
+        telemetry.apply(&quality, &query, &request, &mut pass).await;
         let crate::search_engine::FilteredSemanticOutcome {
             outcome,
             diagnostic: pushdown_diagnostic,
-        } = filtered;
+        } = pass.filtered;
         let scanned = outcome.scanned;
         let backend_label = outcome.backend_label;
         let retrieval_status = outcome.retrieval_status.clone();
         let results = outcome.results;
 
         if params.evidence {
-            let report = crate::evidence::build_evidence_report(&query, results, limit);
+            let report = telemetry.evidence(&query, results, limit);
             let source_paths_verified = crate::oracle::verify_paths(
                 crate::evidence::evidence_source_paths(&report).map(std::path::Path::to_path_buf),
             );
@@ -1465,6 +1446,7 @@ impl AicxMcpServer {
                     report.results,
                     !source_paths_verified,
                 );
+                let base = telemetry.retrieval(base);
                 if pushdown_diagnostic.is_some() {
                     base.mark_partial()
                 } else {
@@ -1490,19 +1472,16 @@ impl AicxMcpServer {
                     .map_err(|e| {
                         McpError::internal_error(format!("Attach index snapshot: {e}"), None)
                     })?;
-            return Ok(CallToolResult::success(vec![ContentBlock::text(payload)]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(attach(
+                &telemetry, payload,
+            )?)]));
         }
 
         // Shared finalize keeps MCP success ordering identical to the CLI and
         // the fuzzy fallback. Kind is already pushed into the semantic query,
         // but we still pass it as a defensive retain (matching the CLI tail) so
         // an off-kind hit cannot slip through if the semantic backend regresses.
-        let results = crate::search_engine::finalize_fuzzy_results(
-            results,
-            kind_filter_dir,
-            params.sort.as_deref(),
-            limit,
-        );
+        let results = telemetry.finalize(results, kind_filter_dir, params.sort.as_deref(), limit);
 
         let source_paths_verified = crate::oracle::verify_paths(
             results
@@ -1519,6 +1498,7 @@ impl AicxMcpServer {
                 results.len(),
                 !source_paths_verified,
             );
+            let base = telemetry.retrieval(base);
             if pushdown_diagnostic.is_some() {
                 base.mark_partial()
             } else {
@@ -1544,7 +1524,9 @@ impl AicxMcpServer {
                     McpError::internal_error(format!("Attach index snapshot: {e}"), None)
                 })?;
 
-        Ok(CallToolResult::success(vec![ContentBlock::text(payload)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(attach(
+            &telemetry, payload,
+        )?)]))
     }
 
     #[tool(
@@ -2646,6 +2628,8 @@ mod tests {
             verbose: false,
             strict_semantic: false,
             deep: Some(false),
+            rerank: None,
+            decide: None,
         }
     }
 

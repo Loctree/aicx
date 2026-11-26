@@ -682,11 +682,58 @@ aicx search --session <session-id> --literal --context 4 <query>
 aicx search --json <query>
 ```
 
-Search combines Tantivy with dense mmap retrieval when CURRENT has vectors and uses Tantivy alone on a lexical generation. A bounded, recency-ranked filesystem fallback is
-used only when the typed failure is `IndexNotBuilt`; corrupt, stale, or busy
-indexes fail honestly. `--no-semantic` is stricter: it reads the published
-CURRENT lexical generation or returns a typed error, and never falls through
-to filesystem fuzzy search.
+Search uses the published Tantivy index and adds dense retrieval when CURRENT
+advertises vectors. CLI and MCP first capture validated Tantivy results with
+the same filters and retain them if dense retrieval fails. JSON identifies the failed layer in `dense_fallback` and
+reports the actual backend in `oracle_status`. Base read and privacy errors
+fail the request. A missing index permits the existing filesystem fallback.
+CLI `--no-semantic` requires a published lexical generation.
+
+Ordinary CLI and MCP search keep the results from the last successful stage.
+Tantivy serves lexical search. When the dense leg succeeds, the hybrid results
+can be reranked. The decision model runs after successful reranking. If it
+fails, the reranked hits remain available.
+
+With no `[retrieval.reranker]` section, AICX checks the local model catalog on
+`127.0.0.1:12346`. It uses the model when the catalog advertises a single
+reranker. For another reranker, or to add a decision model, set the full endpoint
+URL and model in `[retrieval.reranker]` or `[retrieval.decision]`. The endpoint
+is active by default. Set `enabled = false` to turn the stage off. The commented
+examples in `aicx config init` show the limits and optional `api_key_env` name.
+`aicx config show` and
+`aicx config inspect` display each stage's status. Decision protocols are
+`responses` (default), `chat_completions`, and `systemone`.
+Set `max_refinements = 0` to stop after the assessment.
+
+Intern-Decision uses `protocol = "systemone"` and the exact `/v1/systemone`
+URL and served model ID. AICX sends the query and up to four snippets (4096
+UTF-8 bytes each) as text. It requests one binary assessment for sufficiency
+and one for each snippet in the same call. It reports the calibrated
+`sufficiency_probability` and returns a sufficient assessment at 0.8 or
+above when at least one snippet scores above 0.5 for support. These initial
+cutoffs await calibration on AICX queries. The scorer never requests a
+second search.
+
+Reranking defaults to 12 candidates, with a configurable cap of 50. The
+automatically discovered local reranker uses the full 50-candidate cap. Requests
+send both `top_n` and `top_k` for servers using either limit name. The response
+must cover every submitted candidate; incomplete or invalid rankings preserve
+the earlier results and report a failed stage.
+
+Explicit `--rerank` or `--decide` requests a configured stage independently.
+For MCP, use `rerank: true` or `decide: true` to request a stage, and `false`
+to skip it for one request.
+
+JSON responses report optional-stage diagnostics in `retrieval_quality`. A missing configuration,
+unavailable endpoint, or malformed reply is reported alongside usable hits.
+The text view prints a stage summary to stderr. These flags apply to published
+search results, including `--evidence`. Passage lookup with `--session` rejects
+explicit quality flags. Model input uses complete focused passages. A document that exceeds the
+configured model budget produces a stage diagnostic instead of silent
+truncation. Exact project names in the query take precedence over the
+cross-encoder order, and the model ranks results within that project scope.
+
+Filesystem fallback reports requested stages as skipped.
 
 `--session` is the last-mile passage route after a session-level hit. It reads
 the cached whole-session extract when present; otherwise it parses the live
