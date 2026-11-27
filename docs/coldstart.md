@@ -22,7 +22,7 @@ no separate `coldstart` command next to `continuity`.
 ```bash
 aicx sessions current --json      # this agent's session id, for trailers and handoffs
 scutil --get ComputerName          # which machine (macOS; `hostname` elsewhere)
-cs-bus --status                    # which Codescribe channel and name you answer to
+x9bus --status --provider <p> --session <id>  # which x9bus channel and name you answer to
 ```
 
 The name you answer to on the bus is the `<name>` Lens 2 needs.
@@ -56,7 +56,7 @@ The pack renders these sections, in this order:
 | DECISIONS | decision candidates, human turns first | — |
 | TASKS | task candidates, including dispatched checklists | — |
 | OPEN WORK | local branches carrying commits HEAD lacks, the worktree holding each, its newest subject, `Authored-By` and `session_id` | `git worktree list` + `git cherry` by hand |
-| ADDRESSED TO \<NAME\> | Codescribe bus speech addressed to `<name>`, from any project | `cs-bus --history` per channel |
+| ADDRESSED TO \<NAME\> | x9bus speech addressed to `<name>`, from any project | `x9bus --history --channel N` per channel |
 | SOURCES | the session files behind the retained claims | `aicx sessions list` on a human hint |
 | INDEX HEALTH | index freshness, kept apart from continuity coverage | — |
 
