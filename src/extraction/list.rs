@@ -1,7 +1,7 @@
 #![allow(unused_imports)]
 use super::*;
 use crate::extraction::UNPROTECTED_SOURCE_WARNING;
-use crate::importers::codescribe::CODESCRIBE_AGENT;
+use crate::importers::codescribe::{CODESCRIBE_AGENT, transcriptions_roots};
 use crate::importers::{discover_codescribe_transcripts, discover_operator_markdown};
 
 const JUNIE_EVENTS_FILENAME: &str = "events.jsonl";
@@ -479,10 +479,18 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
         sources.push(source_info(&home, "agy", root, scanned.len(), size));
     }
 
-    // Codescribe transcripts: ~/.codescribe/transcriptions/YYYY-MM-DD/*.{txt,md,json}
+    // Codescribe transcripts: ~/.x9bus/transcriptions and the pre-rename
+    // ~/.codescribe/transcriptions, YYYY-MM-DD/*.{txt,md,json}; one row per root.
     let codescribe_transcripts = discover_codescribe_transcripts(&home);
-    if !codescribe_transcripts.is_empty() {
-        let total_size: u64 = codescribe_transcripts
+    for root in transcriptions_roots(&home) {
+        let under_root: Vec<_> = codescribe_transcripts
+            .iter()
+            .filter(|transcript| transcript.path.starts_with(&root))
+            .collect();
+        if under_root.is_empty() {
+            continue;
+        }
+        let total_size: u64 = under_root
             .iter()
             .filter_map(|transcript| fs::metadata(&transcript.path).ok())
             .map(|metadata| metadata.len())
@@ -490,8 +498,8 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
         sources.push(source_info(
             &home,
             CODESCRIBE_AGENT,
-            home.join(".codescribe").join("transcriptions"),
-            codescribe_transcripts.len(),
+            root,
+            under_root.len(),
             total_size,
         ));
     }

@@ -22,7 +22,27 @@ const CODESCRIBE_NO_SPEECH_MARKERS: &[&str] = &[
     "vad_no_speech_detected",
 ];
 
-/// A discovered Codescribe transcript under `$HOME/.codescribe/transcriptions`.
+/// Transcription roots under the operator home, the current product first.
+///
+/// The app has written under `~/.x9bus` since the x9bus rename (2026-11-12);
+/// `~/.codescribe` keeps the takes recorded before it. Both are read, and a
+/// file reachable under both (one root linked to the other) counts once.
+/// Each root is also an approved source root.
+pub const TRANSCRIPTIONS_ROOTS_RELATIVE: [&str; 2] =
+    [".x9bus/transcriptions", ".codescribe/transcriptions"];
+
+/// Product data roots holding `lexicon.custom.jsonl`, the current product first.
+const LEXICON_ROOTS_RELATIVE: [&str; 2] = [".x9bus", ".codescribe"];
+
+/// Every transcription root for one operator home, the current product first.
+pub fn transcriptions_roots(home: &Path) -> Vec<PathBuf> {
+    TRANSCRIPTIONS_ROOTS_RELATIVE
+        .iter()
+        .map(|relative| home.join(relative))
+        .collect()
+}
+
+/// A discovered Codescribe transcript under one of [`transcriptions_roots`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodescribeTranscript {
     pub path: PathBuf,
@@ -80,8 +100,24 @@ struct WhisperSegment {
     speaker: Option<String>,
 }
 
+/// Discover transcripts under every transcription root of `home`.
+///
+/// A file reachable under more than one root is listed once, under the first
+/// root that reaches it.
 pub fn discover_codescribe_transcripts(home: &Path) -> Vec<CodescribeTranscript> {
-    discover_codescribe_transcripts_at(&home.join(".codescribe").join("transcriptions"))
+    let mut seen = HashSet::new();
+    let mut entries = Vec::new();
+    for root in transcriptions_roots(home) {
+        for transcript in discover_codescribe_transcripts_at(&root) {
+            let identity =
+                fs::canonicalize(&transcript.path).unwrap_or_else(|_| transcript.path.clone());
+            if seen.insert(identity) {
+                entries.push(transcript);
+            }
+        }
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    entries
 }
 
 /// Discover Codescribe transcript files under an explicit transcriptions root.
@@ -156,7 +192,13 @@ fn codescribe_timestamp(path: &Path, date: NaiveDate, start_ms: u64) -> DateTime
 }
 
 fn load_codescribe_lexicon(home: &Path) -> CodescribeLexicon {
-    let path = home.join(".codescribe").join("lexicon.custom.jsonl");
+    let Some(path) = LEXICON_ROOTS_RELATIVE
+        .iter()
+        .map(|relative| home.join(relative).join("lexicon.custom.jsonl"))
+        .find(|path| path.is_file())
+    else {
+        return CodescribeLexicon::default();
+    };
     let Ok(file) = sanitize::open_file_validated(&path) else {
         return CodescribeLexicon::default();
     };
@@ -554,7 +596,7 @@ fn codescribe_path_fingerprint(path: &Path) -> String {
     format!("{hash:016x}")
 }
 
-/// Extract Codescribe transcript entries from `$HOME/.codescribe/transcriptions`.
+/// Extract Codescribe transcript entries from every transcription root of `$HOME`.
 pub fn extract_codescribe(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     let home = crate::os_user_home().context("No home dir")?;
     extract_codescribe_from_home(&home, config)

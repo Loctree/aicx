@@ -1,8 +1,10 @@
 //! Codescribe Transcript Bus as a source of operator speech.
 //!
-//! The operator talks (or types) to named agents through the Codescribe bus
-//! (`~/.codescribe/agent-bridge/buses`). An agent reads each delivery with
-//! `cs-bus --read-pending`, so inside the agent's own transcript the operator's
+//! The operator talks (or types) to named agents through the bus of the x9bus
+//! app (`~/.x9bus/agent-bridge/buses`; before the 2026-11-12 rename
+//! `~/.codescribe/agent-bridge/buses`, still read for its history). An agent
+//! reads each delivery with `x9bus --read-pending` (formerly `cs-bus`), so
+//! inside the agent's own transcript the operator's
 //! words exist only as a tool result — a lane `aicx intents` never reads, and
 //! must not, because tool output is not speech. The bus ledger is the record of
 //! what was said and to whom: this module replays it and recovers every
@@ -30,8 +32,13 @@ use crate::timeline::{FrameKind, TimelineEntry};
 
 use super::codescribe::CODESCRIBE_AGENT;
 
-/// Bus root under the operator home; also an approved source root.
-pub const BUS_ROOT_RELATIVE: &str = ".codescribe/agent-bridge/buses";
+/// Bus roots under the operator home, the current product first; each is also
+/// an approved source root. The app has written under `~/.x9bus` since the
+/// x9bus rename (2026-11-12); `~/.codescribe` keeps the ledgers from before it.
+pub const BUS_ROOTS_RELATIVE: [&str; 2] = [
+    ".x9bus/agent-bridge/buses",
+    ".codescribe/agent-bridge/buses",
+];
 
 const EVIDENCE_SCHEMA: &str = "codescribe.transcript-evidence.v1";
 const CHANNEL_SESSION_SCHEMA: &str = "codescribe.channel-session.v1";
@@ -378,24 +385,35 @@ pub fn replay_bus_ledger(body: &str) -> BusReplay {
     replayer.finish()
 }
 
-/// Bus root for one operator home.
-pub fn bus_root(user_home: &Path) -> PathBuf {
-    user_home.join(BUS_ROOT_RELATIVE)
+/// Every bus root for one operator home, the current product first.
+pub fn bus_roots(user_home: &Path) -> Vec<PathBuf> {
+    BUS_ROOTS_RELATIVE
+        .iter()
+        .map(|relative| user_home.join(relative))
+        .collect()
 }
 
-/// Every bus ledger on disk: live channel files and archived generations.
+/// Every bus ledger on disk under every bus root: live channel files and
+/// archived generations. A ledger reachable under more than one root (one
+/// root linked to the other) is listed once, under the first root that
+/// reaches it.
 pub fn discover_bus_ledgers(user_home: &Path) -> Vec<PathBuf> {
-    let root = bus_root(user_home);
     let mut ledgers = Vec::new();
-    collect_ledgers(&root, &mut ledgers);
-    if let Ok(days) = std::fs::read_dir(root.join("events")) {
-        for day in days.flatten() {
-            let path = day.path();
-            if path.is_dir() {
-                collect_ledgers(&path, &mut ledgers);
+    for root in bus_roots(user_home) {
+        collect_ledgers(&root, &mut ledgers);
+        if let Ok(days) = std::fs::read_dir(root.join("events")) {
+            for day in days.flatten() {
+                let path = day.path();
+                if path.is_dir() {
+                    collect_ledgers(&path, &mut ledgers);
+                }
             }
         }
     }
+    let mut seen = HashSet::new();
+    ledgers.retain(|ledger| {
+        seen.insert(std::fs::canonicalize(ledger).unwrap_or_else(|_| ledger.clone()))
+    });
     ledgers.sort();
     ledgers
 }
@@ -842,8 +860,66 @@ mod tests {
     }
 
     #[test]
-    fn bus_root_is_an_approved_source_root() {
-        assert!(crate::source_path::DEFAULT_SOURCE_ROOT_RELATIVE.contains(&BUS_ROOT_RELATIVE));
+    fn every_bus_and_transcription_root_is_an_approved_source_root() {
+        let transcriptions = crate::importers::codescribe::TRANSCRIPTIONS_ROOTS_RELATIVE;
+        for root in BUS_ROOTS_RELATIVE.into_iter().chain(transcriptions) {
+            assert!(
+                crate::source_path::DEFAULT_SOURCE_ROOT_RELATIVE.contains(&root),
+                "{root} must be an approved source root"
+            );
+        }
+    }
+
+    fn scratch_home(name: &str) -> PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "aicx-bus-roots-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).expect("create scratch home");
+        home
+    }
+
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().expect("ledger has a parent")).expect("create dir");
+        std::fs::write(path, "").expect("write ledger");
+    }
+
+    #[test]
+    fn ledgers_under_the_x9bus_and_the_codescribe_root_are_both_discovered() {
+        let home = scratch_home("both");
+        let current = home.join(".x9bus/agent-bridge/buses");
+        let legacy = home.join(".codescribe/agent-bridge/buses");
+        touch(&current.join("channel-5.jsonl"));
+        touch(&current.join("events/2026_1126/channel-5.compressed.jsonl"));
+        touch(&legacy.join("channel-5.jsonl"));
+        touch(&legacy.join("events/2026_1110/channel-1.compressed.jsonl"));
+
+        let ledgers = discover_bus_ledgers(&home);
+        assert_eq!(ledgers.len(), 4, "{ledgers:?}");
+        assert!(ledgers.contains(&current.join("channel-5.jsonl")));
+        assert!(ledgers.contains(&legacy.join("channel-5.jsonl")));
+        assert!(ledgers.contains(&current.join("events/2026_1126/channel-5.compressed.jsonl")));
+        assert!(ledgers.contains(&legacy.join("events/2026_1110/channel-1.compressed.jsonl")));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_ledger_reachable_under_both_roots_is_listed_once() {
+        let home = scratch_home("linked");
+        let current = home.join(".x9bus/agent-bridge/buses");
+        touch(&current.join("channel-5.jsonl"));
+        std::fs::create_dir_all(home.join(".codescribe/agent-bridge")).expect("create legacy dir");
+        std::os::unix::fs::symlink(&current, home.join(".codescribe/agent-bridge/buses"))
+            .expect("link legacy bus root to the current one");
+
+        let ledgers = discover_bus_ledgers(&home);
+        assert_eq!(ledgers, vec![current.join("channel-5.jsonl")]);
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

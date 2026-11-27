@@ -18,8 +18,10 @@
 //! - `~/.omp/agent/sessions`
 //! - `~/.pi/agent/sessions`
 //! - `~/.vibecrafted/control_plane/runtime_runs`
-//! - `~/.codescribe/agent-bridge/buses` (Codescribe Transcript Bus ledgers)
-//! - `~/.codescribe/transcriptions` (Codescribe dictated takes)
+//! - `~/.x9bus/agent-bridge/buses` (x9bus bus ledgers)
+//! - `~/.x9bus/transcriptions` (x9bus dictated takes)
+//! - `~/.codescribe/agent-bridge/buses` and `~/.codescribe/transcriptions`
+//!   (the same, recorded before the 2026-11-12 rename to x9bus)
 //! - the active AICX home (`$AICX_HOME` / `~/.aicx`)
 //!
 //! Unit tests register their tempfile roots explicitly via [`SourceAllowlist::from_roots`]
@@ -46,7 +48,10 @@ pub const DEFAULT_SOURCE_ROOT_RELATIVE: &[&str] = &[
     ".omp/agent/sessions",
     ".pi/agent/sessions",
     ".vibecrafted/control_plane/runtime_runs",
-    // `importers::codescribe_bus::BUS_ROOT_RELATIVE`; a test pins the two.
+    // `importers::codescribe_bus::BUS_ROOTS_RELATIVE` and
+    // `importers::codescribe::TRANSCRIPTIONS_ROOTS_RELATIVE`; tests pin them.
+    ".x9bus/agent-bridge/buses",
+    ".x9bus/transcriptions",
     ".codescribe/agent-bridge/buses",
     ".codescribe/transcriptions",
 ];
