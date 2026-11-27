@@ -165,3 +165,89 @@ fn catalog_takes_keep_one_text_per_recording_and_never_admit_failed_or_rewrites(
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn transcripts_under_the_x9bus_and_the_codescribe_root_are_both_discovered() {
+    let root = unique_test_dir("both-roots");
+    let home = root.join("home");
+    write_file(
+        &home.join(".codescribe/transcriptions/2026-11-13/100000_before-rename_raw.txt"),
+        "Decision: recorded before the rename.",
+    );
+    write_file(
+        &home.join(".x9bus/transcriptions/2026-11-27/100000_after-rename_raw.txt"),
+        "Decision: recorded after the rename.",
+    );
+
+    let names: Vec<String> = discover_codescribe_transcripts(&home)
+        .iter()
+        .map(|transcript| {
+            transcript
+                .path
+                .file_name()
+                .expect("transcript has a file name")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "100000_before-rename_raw.txt".to_string(),
+            "100000_after-rename_raw.txt".to_string()
+        ]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_transcript_reachable_under_both_roots_is_discovered_once() {
+    let root = unique_test_dir("linked-roots");
+    let home = root.join("home");
+    let current = home.join(".x9bus").join("transcriptions");
+    write_file(
+        &current.join("2026-11-27").join("100000_take_raw.txt"),
+        "Decision: one take, two paths.",
+    );
+    fs::create_dir_all(home.join(".codescribe")).expect("create legacy home");
+    std::os::unix::fs::symlink(&current, home.join(".codescribe").join("transcriptions"))
+        .expect("link the legacy root to the current one");
+
+    let discovered = discover_codescribe_transcripts(&home);
+    assert_eq!(discovered.len(), 1, "{discovered:?}");
+    assert!(discovered[0].path.starts_with(&current));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_lexicon_is_read_from_the_x9bus_home() {
+    let root = unique_test_dir("x9bus-lexicon");
+    let home = root.join("home");
+    let day = home
+        .join(".x9bus")
+        .join("transcriptions")
+        .join("2026-04-30");
+    let repo_root = home.join("Libraxis").join("vibecrafted");
+    fs::create_dir_all(repo_root.join(".git")).expect("create project hint repo");
+    write_file(
+        &home.join(".x9bus").join("lexicon.custom.jsonl"),
+        r#"{"speaker":"engineer","keywords":["Vetcoders","vibecrafted"]}"#,
+    );
+    write_file(
+        &day.join("175300_operator-decision_raw.txt"),
+        "Decision: Vibecrafted owns the operator workflow for Vetcoders.",
+    );
+
+    let entries = extract_codescribe_from_home(&home, &extraction_config()).expect("extract");
+    assert_eq!(entries.len(), 1);
+    assert!(
+        entries[0].message.contains("speaker_hint: engineer"),
+        "{}",
+        entries[0].message
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}

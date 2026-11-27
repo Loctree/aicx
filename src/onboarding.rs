@@ -1661,7 +1661,7 @@ fn inspect_sources(user_home: &Path) -> Vec<OnboardingSource> {
             session_files_truncated,
         )
     };
-    let codescribe_root = user_home.join(".codescribe").join("transcriptions");
+    let codescribe_roots = crate::importers::codescribe::transcriptions_roots(user_home);
     let codescribe_files =
         crate::importers::codescribe::discover_codescribe_transcripts(user_home).len();
     vec![
@@ -1670,7 +1670,7 @@ fn inspect_sources(user_home: &Path) -> Vec<OnboardingSource> {
         source_row(
             "codescribe",
             "Codescribe",
-            std::slice::from_ref(&codescribe_root),
+            &codescribe_roots,
             codescribe_files,
             false,
         ),

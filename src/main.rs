@@ -15,7 +15,8 @@
 //! - Gemini: ~/.gemini/tmp/<hash>/chats/session-*.json
 //! - Gemini Antigravity: ~/.gemini/antigravity/{conversations/<uuid>.pb,brain/<uuid>/}
 //! - Junie: ~/.junie/sessions/session-*/events.jsonl
-//! - Codescribe: ~/.codescribe/transcriptions/YYYY-MM-DD/*.{txt,md,json}
+//! - Codescribe: ~/.x9bus/transcriptions and the pre-rename ~/.codescribe/transcriptions,
+//!   YYYY-MM-DD/*.{txt,md,json}
 //! - Operator markdown: ~/Downloads/*.md, ~/.vibecrafted/inbox/*.md
 //!
 //! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders

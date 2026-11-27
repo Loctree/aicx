@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+### Fixed
+
+- The bus and dictation importers also read the x9bus app's current locations,
+  `~/.x9bus/agent-bridge/buses` and `~/.x9bus/transcriptions`, next to the
+  pre-rename `~/.codescribe` ones. Since the app was renamed to x9bus, new bus
+  messages and dictated takes land only under `~/.x9bus`, so they were missing
+  from the index. Both locations are approved source roots; a file reachable
+  under both is read once. Source and agent names stay `codescribe`.
+
 ## [0.16.1] - 2026-11-20
 
 ### Changed
